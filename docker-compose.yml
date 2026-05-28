@@ -1,0 +1,118 @@
+version: "3.8"
+
+services:
+  opensearch-primary:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch-primary
+    environment:
+      - cluster.name=primary-cluster
+      - node.name=opensearch-primary
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-primary-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - opensearch-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  opensearch-secondary:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch-secondary
+    environment:
+      - cluster.name=secondary-cluster
+      - node.name=opensearch-secondary
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-secondary-data:/usr/share/opensearch/data
+    ports:
+      - "9201:9200"
+      - "9301:9300"
+    networks:
+      - opensearch-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  opensearch-init:
+    image: curlimages/curl:8.6.0
+    container_name: opensearch-init
+    depends_on:
+      opensearch-primary:
+        condition: service_healthy
+      opensearch-secondary:
+        condition: service_healthy
+    volumes:
+      - ./init:/init:ro
+      - ./indices.json:/indices.json:ro
+    networks:
+      - opensearch-net
+    entrypoint: ["/bin/sh", "/init/setup.sh"]
+    restart: "no"
+
+  opensearch-dashboards-primary:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: opensearch-dashboards-primary
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch-primary:9200
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch-primary:
+        condition: service_healthy
+
+  opensearch-dashboards-secondary:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: opensearch-dashboards-secondary
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch-secondary:9200
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5602:5601"
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch-secondary:
+        condition: service_healthy
+
+volumes:
+  opensearch-primary-data:
+  opensearch-secondary-data:
+
+networks:
+  opensearch-net:
+    driver: bridge

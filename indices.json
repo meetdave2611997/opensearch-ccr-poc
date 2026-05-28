@@ -1,0 +1,28 @@
+{
+  "indices": [
+    {
+      "name": "products",
+      "description": "Product catalog",
+      "shards": 1,
+      "replicas": 0
+    },
+    {
+      "name": "orders",
+      "description": "Customer orders",
+      "shards": 1,
+      "replicas": 0
+    },
+    {
+      "name": "users",
+      "description": "User profiles",
+      "shards": 1,
+      "replicas": 0
+    },
+    {
+      "name": "events",
+      "description": "Application event logs",
+      "shards": 1,
+      "replicas": 0
+    }
+  ]
+}
