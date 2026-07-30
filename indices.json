@@ -4,25 +4,64 @@
       "name": "products",
       "description": "Product catalog",
       "shards": 1,
-      "replicas": 0
+      "replicas": 0,
+      "autofollow": true
     },
     {
       "name": "orders",
       "description": "Customer orders",
       "shards": 1,
-      "replicas": 0
+      "replicas": 0,
+      "autofollow": false
     },
     {
       "name": "users",
       "description": "User profiles",
       "shards": 1,
-      "replicas": 0
+      "replicas": 0,
+      "autofollow": false
     },
     {
       "name": "events",
       "description": "Application event logs",
       "shards": 1,
-      "replicas": 0
+      "replicas": 0,
+      "autofollow": true
+    },
+    {
+      "name": "inventory",
+      "description": "Product inventory / stock levels",
+      "shards": 1,
+      "replicas": 0,
+      "autofollow": true
+    },
+    {
+      "name": "reviews",
+      "description": "Customer product reviews",
+      "shards": 1,
+      "replicas": 0,
+      "autofollow": false
+    },
+    {
+      "name": "sessions",
+      "description": "User session activity",
+      "shards": 1,
+      "replicas": 0,
+      "autofollow": false
+    },
+    {
+      "description": "Metrics index 1",
+      "shards": 1,
+      "replicas": 0,
+      "autofollow": true,
+      "autofollow_pattern": "metrics-idx*"
+    },
+    {
+      "description": "Sample index 1",
+      "shards": 1,
+      "replicas": 0,
+      "autofollow": true,
+      "autofollow_pattern": "sample-idx*"
     }
   ]
 }
