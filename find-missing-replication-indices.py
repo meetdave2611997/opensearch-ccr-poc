@@ -11,14 +11,20 @@ CCR replication for that index on the destination cluster.
 
 Usage:
   python3 find-missing-replication-indices.py
-  python3 find-missing-replication-indices.py --source-url http://localhost:9200 \\
-      --destination-url http://localhost:9201 --leader-alias primary-cluster
+  python3 find-missing-replication-indices.py --primary-url http://localhost:9200 \\
+      --secondary-url http://localhost:9201 --direction primary-to-secondary
 
   python3 find-missing-replication-indices.py --config path/to/config.json
 
+Uses the same config.json / env-var schema as dr-switchover.py
+(primary_url, secondary_url, primary_alias_on_secondary,
+secondary_alias_on_primary, username, password, verify_ssl).
+The --direction flag picks which of primary/secondary is SOURCE (leader)
+vs. DESTINATION (follower) for this comparison.
+
 Configuration precedence (highest → lowest):
   1. CLI flags
-  2. Environment variables  (OPENSEARCH_SOURCE_URL, etc.)
+  2. Environment variables  (OPENSEARCH_PRIMARY_URL, etc.)
   3. config.json
   4. Built-in defaults (localhost for local Docker testing)
 """
@@ -63,12 +69,15 @@ def header(msg: str) -> None:
 
 @dataclass
 class Config:
-    source_url: str      = "http://localhost:9200"
-    destination_url: str = "http://localhost:9201"
+    primary_url: str   = "http://localhost:9200"
+    secondary_url: str = "http://localhost:9201"
 
-    # AWS pre-configured connection alias, visible from DESTINATION,
-    # that points to SOURCE. Used as leader_alias when starting replication.
-    leader_alias: str = "primary-cluster"
+    # AWS pre-configured connection aliases (identical semantics to dr-switchover.py).
+    # primary_alias_on_secondary : alias visible from SECONDARY that points to PRIMARY.
+    primary_alias_on_secondary: str = "primary-cluster"
+
+    # secondary_alias_on_primary : alias visible from PRIMARY that points to SECONDARY.
+    secondary_alias_on_primary: str = "secondary-cluster"
 
     # Optional basic-auth credentials (not required for local Docker / security-disabled)
     username: str = ""
@@ -97,9 +106,10 @@ def load_config(config_path: Optional[str], cli_overrides: dict) -> Config:
                 setattr(cfg, key, value)
 
     env_map = {
-        "OPENSEARCH_SOURCE_URL":      "source_url",
-        "OPENSEARCH_DESTINATION_URL": "destination_url",
-        "OPENSEARCH_LEADER_ALIAS":    "leader_alias",
+        "OPENSEARCH_PRIMARY_URL":     "primary_url",
+        "OPENSEARCH_SECONDARY_URL":   "secondary_url",
+        "OPENSEARCH_PRIMARY_ALIAS":   "primary_alias_on_secondary",
+        "OPENSEARCH_SECONDARY_ALIAS": "secondary_alias_on_primary",
         "OPENSEARCH_USERNAME":        "username",
         "OPENSEARCH_PASSWORD":        "password",
     }
@@ -198,10 +208,16 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument("--config", metavar="FILE", help="Path to JSON config file")
-    parser.add_argument("--source-url",      metavar="URL",   help="Source (leader) cluster URL")
-    parser.add_argument("--destination-url", metavar="URL",   help="Destination (follower) cluster URL")
-    parser.add_argument("--leader-alias",    metavar="ALIAS",
-                        help="Connection alias on DESTINATION pointing to SOURCE")
+    parser.add_argument("--primary-url",   metavar="URL",   help="Primary cluster URL")
+    parser.add_argument("--secondary-url", metavar="URL",   help="Secondary cluster URL")
+    parser.add_argument("--primary-alias",  metavar="ALIAS",
+                        help="Connection alias on SECONDARY pointing to PRIMARY")
+    parser.add_argument("--secondary-alias", metavar="ALIAS",
+                        help="Connection alias on PRIMARY pointing to SECONDARY")
+    parser.add_argument("--direction", choices=["primary-to-secondary", "secondary-to-primary"],
+                        default="primary-to-secondary",
+                        help="Which cluster is SOURCE (leader) vs. DESTINATION (follower). "
+                             "Default: primary-to-secondary (primary is SOURCE).")
     parser.add_argument("--output-file", metavar="PATH",
                         help="Optional path to also write the generated curl commands to")
     parser.add_argument("--no-colour", action="store_true", help="Disable ANSI colours")
@@ -216,23 +232,32 @@ def main() -> None:
             setattr(C, attr, "")
 
     cli_overrides = {
-        "source_url":      args.source_url,
-        "destination_url": args.destination_url,
-        "leader_alias":    args.leader_alias,
+        "primary_url":                args.primary_url,
+        "secondary_url":              args.secondary_url,
+        "primary_alias_on_secondary": args.primary_alias,
+        "secondary_alias_on_primary": args.secondary_alias,
     }
     cfg = load_config(args.config, cli_overrides)
 
+    if args.direction == "primary-to-secondary":
+        source_url, destination_url = cfg.primary_url, cfg.secondary_url
+        leader_alias = cfg.secondary_alias_on_primary
+    else:
+        source_url, destination_url = cfg.secondary_url, cfg.primary_url
+        leader_alias = cfg.primary_alias_on_secondary
+
     header("CCR — Missing Replication Indices Finder")
-    info(f"Source cluster      : {cfg.source_url}")
-    info(f"Destination cluster : {cfg.destination_url}")
-    info(f"Leader alias        : {cfg.leader_alias}")
+    info(f"Direction           : {args.direction}")
+    info(f"Source cluster      : {source_url}")
+    info(f"Destination cluster : {destination_url}")
+    info(f"Leader alias        : {leader_alias}")
 
     step("Fetching indices from SOURCE cluster")
-    source_indices = list_indices(cfg.source_url, cfg)
+    source_indices = list_indices(source_url, cfg)
     ok(f"Found {len(source_indices)} non-system index(es) on SOURCE.")
 
     step("Fetching indices from DESTINATION cluster")
-    destination_indices = list_indices(cfg.destination_url, cfg)
+    destination_indices = list_indices(destination_url, cfg)
     ok(f"Found {len(destination_indices)} non-system index(es) on DESTINATION.")
 
     missing = sorted(set(source_indices) - set(destination_indices))
@@ -249,7 +274,7 @@ def main() -> None:
     step("Curl commands to start replication on DESTINATION")
     commands = []
     for idx in missing:
-        cmd = build_start_replication_curl(cfg.destination_url, cfg.leader_alias, idx, cfg)
+        cmd = build_start_replication_curl(destination_url, leader_alias, idx, cfg)
         commands.append(cmd)
         print(f"\n{C.CYAN}# start replication for '{idx}'{C.RESET}")
         print(cmd)
