@@ -178,45 +178,54 @@ def load_indices(indices_file: str) -> list[str]:
     The caller must ensure at least one autofollow rule exists in that case.
     """
     data = _load_indices_data(indices_file)
-    return [entry["name"] for entry in data.get("indices", []) if "name" in entry]
+    return [
+        entry["name"]
+        for entry in data.get("indices", [])
+        if "name" in entry and not entry.get("autofollow", False)
+    ]
 
 
 def load_autofollow_rules(indices_file: str) -> list[dict]:
     """
     Return auto-follow rules derived from index entries with "autofollow": true.
 
-    Each rule dict contains:
-      "name"    — the rule name used when registering/deleting the rule in OpenSearch.
-                  Defaults to the index "name" field when present.
-                  For autofollow-only entries (no "name"), falls back to "autofollow_pattern".
-      "pattern" — the wildcard pattern sent to OpenSearch.
-                  Defaults to the exact index name when "autofollow_pattern" is not set.
-                  Set "autofollow_pattern": "metrics-idx*" to match a family of indices.
+    Rules:
+      - "autofollow_pattern" is REQUIRED when "autofollow": true.
+        The pattern is never inferred from "name" — they serve different purposes:
+          "name"             → OpenSearch rule identifier (no wildcards allowed)
+          "autofollow_pattern" → wildcard expression matched against leader index names
+
+    Each rule dict returned contains:
+      "name"    — rule identifier sent to OpenSearch (from "name" field, or derived from
+                  "autofollow_pattern" by stripping wildcard characters when "name" absent)
+      "pattern" — exact value of "autofollow_pattern"
 
     Two supported entry shapes:
-      1. Named index with optional pattern override:
-           { "name": "products", "autofollow": true }
+      1. Named index with explicit pattern:
            { "name": "metrics-idx", "autofollow": true, "autofollow_pattern": "metrics-idx*" }
 
-      2. Autofollow-only (no base index, pattern required):
+      2. Autofollow-only entry (no concrete base index):
            { "autofollow": true, "autofollow_pattern": "metrics-idx*" }
+           Rule name derived as: re.sub(r"[*?]", "", "metrics-idx*").strip("-_") → "metrics-idx"
 
-    Entries without the "autofollow" key, or with "autofollow": false, are skipped.
+    Entries with "autofollow": false, or with "autofollow": true but missing/empty
+    "autofollow_pattern", are skipped with an error logged.
     """
     data = _load_indices_data(indices_file)
     rules = []
     for entry in data.get("indices", []):
         if not entry.get("autofollow", False):
             continue
-        pattern = entry.get("autofollow_pattern") or entry.get("name")
+        pattern = entry.get("autofollow_pattern", "").strip()
         if not pattern:
-            err(f"indices.json entry has 'autofollow: true' but neither 'name' nor "
-                f"'autofollow_pattern' is set — skipping: {entry}")
-            continue
-        # OpenSearch rule names must not contain wildcard characters (* ? etc.).
-        # Strip them from the pattern to derive a safe name when no explicit name exists.
+            label = entry.get("name", repr(entry))
+            err(f"  [{label}] autofollow: true requires 'autofollow_pattern' — skipping. "
+                f"(pattern is never inferred from 'name')")
+            exit(1)
+        # Derive a wildcard-free rule name: prefer explicit "name", otherwise strip
+        # wildcard chars from the pattern so the rule name is a valid OS identifier.
         raw_name = entry.get("name") or re.sub(r"[*?]", "", pattern).strip("-_")
-        rule_name = raw_name or pattern  # last-resort fallback
+        rule_name = raw_name or pattern
         rules.append({"name": rule_name, "pattern": pattern})
     return rules
 
@@ -431,6 +440,19 @@ def get_autofollow_stats(base_url: str, cfg: Config) -> dict:
         return {}
 
 
+def get_existing_autofollow_rule(base_url: str, rule_name: str, cfg: Config) -> Optional[dict]:
+    """
+    Return the existing auto-follow rule dict for rule_name from autofollow_stats,
+    or None if no rule with that name is registered on the cluster.
+    The returned dict contains at minimum: {"name": ..., "pattern": ...}.
+    """
+    stats = get_autofollow_stats(base_url, cfg)
+    for rule in stats.get("autofollow_stats", []):
+        if rule.get("name") == rule_name:
+            return rule
+    return None
+
+
 def discover_wildcard_indices(base_url: str, pattern: str, cfg: Config) -> list[str]:
     """
     Return all index names on the cluster whose name matches the given wildcard pattern.
@@ -445,17 +467,19 @@ def discover_wildcard_indices(base_url: str, pattern: str, cfg: Config) -> list[
     if "*" not in pattern and "?" not in pattern:
         return []
 
-    # Use _cat/indices with the wildcard pattern; format=json for easy parsing.
-    # Exclude hidden system indices (starting with '.') via the h parameter filter.
-    url = f"{base_url}/_cat/indices/{pattern}?h=index&format=json"
+    # Use the _settings API with the wildcard pattern.
+    # The response is a dict whose top-level keys are the matching index names —
+    # stable and consistent across all OpenSearch versions, no column-parsing needed.
+    # (_cat/indices with ?h=index&format=json can return plain strings instead of
+    #  objects on some builds, causing silent .get() failures.)
+    url = f"{base_url}/{pattern}/_settings"
     try:
         r = _request("GET", url, cfg)
         if r.status_code >= 400:
             return []
         return sorted(
-            entry.get("index", "")
-            for entry in r.json()
-            if entry.get("index") and not entry["index"].startswith(".")
+            name for name in r.json().keys()
+            if not name.startswith(".")
         )
     except Exception:
         return []
@@ -549,21 +573,15 @@ def delete_and_start_replication(
     then start CCR replication for each index with retry backoff.
     Returns True only if all indices were successfully started.
 
-    Safety pre-step: stop any active CCR replication and remove write blocks before
-    deleting.  CCR marks follower indices read-only (block 1000) — DELETE returns
-    HTTP 403 without this step.
+    Smart CCR pre-step: before deletion, each named index is checked via
+    replication_status. If an index is an active CCR follower (SYNCING, BOOTSTRAPPING,
+    or PAUSED) it is stopped and unblocked. Indices that are not CCR followers (e.g.
+    ex-leader indices in a normal failover) are skipped silently with no output.
 
     Wildcard cleanup: when autofollow_rules is provided, any indices on the follower
-    cluster that match a wildcard pattern (e.g. metrics-idx-01..50) are also stopped,
-    unblocked, and deleted.  These indices are NOT started via explicit replication —
-    the auto-follow rule re-creates them automatically on the new follower once
-    _apply_autofollow_rules creates the rule.
+    cluster that match a wildcard pattern (e.g. products-1, products-2) are stopped,
+    unblocked, and deleted before the auto-follow rule is re-created on this cluster.
     """
-    # ── Safety pre-step: stop + unblock named indices ─────────────────────
-    step("Stopping any active replication on follower cluster before delete...")
-    for idx in indices:
-        stop_replication(follower_url, idx, cfg)
-        remove_write_block(follower_url, idx, cfg)
 
     # ── Discover wildcard-managed indices that also need to be cleaned up ──
     wildcard_extra: list[str] = []
@@ -573,12 +591,6 @@ def delete_and_start_replication(
             matched = discover_wildcard_indices(follower_url, rule["pattern"], cfg)
             extra = [idx for idx in matched if idx not in named_set]
             if extra:
-                info(f"  [auto-follow '{rule['name']}'] pattern '{rule['pattern']}' → "
-                     f"{len(extra)} wildcard index(es) on follower to clean up: "
-                     + ", ".join(extra))
-                for idx in extra:
-                    stop_replication(follower_url, idx, cfg)
-                    remove_write_block(follower_url, idx, cfg)
                 wildcard_extra.extend(extra)
 
     # ── Destructive confirmation (shows named + wildcard indices) ──────────
@@ -587,11 +599,16 @@ def delete_and_start_replication(
         info("Skipped. You can delete the indices and start replication manually later.")
         return False
 
-    # ── Delete named indices ───────────────────────────────────────────────
-    step("Deleting indices on follower cluster...")
-    delete_results = [delete_index(follower_url, idx, cfg) for idx in all_to_delete]
-    if not all(delete_results):
-        failed = [idx for idx, ok_ in zip(all_to_delete, delete_results) if not ok_]
+    # ── Delete indices (with CCR-block fallback) ───────────────────────────
+    step(f"Deleting indices on follower cluster ({follower_url})...")
+    failed: list[str] = []
+    for idx in all_to_delete:
+        stop_replication(follower_url, idx, cfg)
+        remove_write_block(follower_url, idx, cfg)
+        if not delete_index(follower_url, idx, cfg):
+            failed.append(idx)
+
+    if failed:
         err(f"Delete failed for: {', '.join(failed)}")
         err("Aborting replication start to avoid partial state. "
             "Fix errors above, delete remaining indices manually, then start replication.")
@@ -600,7 +617,7 @@ def delete_and_start_replication(
     # ── Start explicit replication for named indices only ─────────────────
     # Wildcard indices are intentionally excluded here — they will be re-created
     # automatically when the auto-follow rule is applied on the new follower.
-    step("Starting replication on follower cluster...")
+    step(f"Starting replication on follower cluster ({follower_url})...")
     start_results = [
         _retry_with_backoff(
             lambda idx=idx: start_replication(follower_url, leader_alias, idx, cfg),
@@ -624,28 +641,55 @@ def _apply_autofollow_rules(
     autofollow_rules: list[dict],
     cfg: Config,
     action: str,  # "create" or "delete"
+    non_interactive: bool = False,
 ) -> None:
     """
     Create or delete all auto-follow rules on a follower cluster.
 
-    When deleting a rule that uses a wildcard pattern, OpenSearch only stops new indices
-    from being picked up — existing follower indices created by the rule remain read-only
-    and keep replicating.  This function therefore discovers all live wildcard-matched
-    followers, stops their replication, and removes their write blocks *before* deleting
-    the rule, ensuring a clean teardown.
+    action="create":
+      Before creating each rule, checks whether a rule with the same name already
+      exists on the follower cluster (via autofollow_stats):
+        - Not found            → create normally.
+        - Found, same pattern  → skip (idempotent, no change needed).
+        - Found, diff pattern  → warn and prompt for approval to replace
+                                 (delete existing then create new).
+
+    action="delete":
+      When deleting a wildcard-pattern rule, OpenSearch only stops new indices from
+      being picked up — existing follower indices remain read-only and keep replicating.
+      This function therefore discovers all live wildcard-matched followers, stops their
+      replication, and removes their write blocks *before* deleting the rule, ensuring a
+      clean teardown.
     """
     if not autofollow_rules:
         return
 
     if action == "create":
-        step("Creating auto-follow rules on follower cluster...")
         for rule in autofollow_rules:
+            existing = get_existing_autofollow_rule(follower_url, rule["name"], cfg)
+            if existing is not None:
+                existing_pattern = existing.get("pattern", "")
+                if existing_pattern == rule["pattern"]:
+                    info(f"  [{rule['name']}] auto-follow rule already exists "
+                         f"with same pattern '{existing_pattern}' — skipping.")
+                    continue
+                warn(f"  [{rule['name']}] rule already exists with a different pattern: "
+                     f"current='{existing_pattern}'  new='{rule['pattern']}'")
+                if not confirm(
+                    f"Replace existing auto-follow rule '{rule['name']}' "
+                    f"(pattern: '{existing_pattern}' → '{rule['pattern']}')?",
+                    non_interactive,
+                    dry_run=cfg.dry_run,
+                ):
+                    warn(f"  [{rule['name']}] skipped — existing rule kept.")
+                    continue
+                delete_autofollow_rule(follower_url, leader_alias, rule["name"], cfg)
             create_autofollow_rule(
                 follower_url, leader_alias,
                 rule["name"], rule["pattern"], cfg,
             )
+
     elif action == "delete":
-        step("Deleting auto-follow rules from follower cluster...")
         for rule in autofollow_rules:
             pattern = rule["pattern"]
 
@@ -661,6 +705,9 @@ def _apply_autofollow_rules(
                 for idx in wildcard_indices:
                     stop_replication(follower_url, idx, cfg)
                     remove_write_block(follower_url, idx, cfg)
+            else:
+                info(f"  [{rule['name']}] pattern '{pattern}' → "
+                     f"no existing follower indices found on this cluster")
 
             delete_autofollow_rule(follower_url, leader_alias, rule["name"], cfg)
 
@@ -723,6 +770,14 @@ def do_failover(
 
     # Tear down auto-follow rules before declaring SECONDARY active so no new
     # indices can be picked up by the rule in the window before it is deleted.
+    step(f"Step 2 — Delete auto-follow rules on SECONDARY ({cfg.secondary_url})")
+    if autofollow_rules and not confirm(
+        f"Delete {len(autofollow_rules)} auto-follow rule(s) from SECONDARY ({cfg.secondary_url})?",
+        non_interactive,
+        dry_run=cfg.dry_run,
+    ):
+        info("Aborted.")
+        return
     _apply_autofollow_rules(
         cfg.secondary_url, cfg.primary_alias_on_secondary,
         autofollow_rules, cfg, action="delete",
@@ -732,7 +787,7 @@ def do_failover(
     warn("DR TESTING CAN NOW BEGIN on the secondary cluster.")
 
     # ── Step 3: Delete indices on PRIMARY + start reverse replication ─────
-    step("Step 3 — Delete indices on PRIMARY, then start replication (following SECONDARY)")
+    step(f"Step 3 — Delete indices on PRIMARY ({cfg.primary_url}), then start replication (following SECONDARY ({cfg.secondary_url}))")
     info(f"Follower cluster : {cfg.primary_url}")
     info(f"Leader alias     : {cfg.secondary_alias_on_primary}")
     info("")
@@ -753,10 +808,12 @@ def do_failover(
     )
 
     # ── Step 4: Create auto-follow rules on PRIMARY (new follower) ────────
+    step(f"Step 4 — Create auto-follow rules on PRIMARY ({cfg.primary_url})")
     if started and autofollow_rules:
         _apply_autofollow_rules(
             cfg.primary_url, cfg.secondary_alias_on_primary,
             autofollow_rules, cfg, action="create",
+            non_interactive=non_interactive,
         )
 
     ok("FAILOVER complete.")
@@ -822,6 +879,14 @@ def do_failback(
             return
 
     # Tear down auto-follow rules before declaring PRIMARY active.
+    step(f"Step 2 — Delete auto-follow rules on PRIMARY ({cfg.primary_url})")
+    if autofollow_rules and not confirm(
+        f"Delete {len(autofollow_rules)} auto-follow rule(s) from PRIMARY ({cfg.primary_url})?",
+        non_interactive,
+        dry_run=cfg.dry_run,
+    ):
+        info("Aborted.")
+        return
     _apply_autofollow_rules(
         cfg.primary_url, cfg.secondary_alias_on_primary,
         autofollow_rules, cfg, action="delete",
@@ -830,7 +895,7 @@ def do_failback(
     ok("PRIMARY is now active (read/write). DR testing is over.")
 
     # ── Step 3: Delete indices on SECONDARY + restore forward replication ─
-    step("Step 3 — Delete indices on SECONDARY, then restore replication (following PRIMARY)")
+    step(f"Step 3 — Delete indices on SECONDARY ({cfg.secondary_url}), then restore replication (following PRIMARY ({cfg.primary_url}))")
     info(f"Follower cluster : {cfg.secondary_url}")
     info(f"Leader alias     : {cfg.primary_alias_on_secondary}")
     info("")
@@ -851,10 +916,12 @@ def do_failback(
     )
 
     # ── Step 4: Create auto-follow rules on SECONDARY (new follower) ──────
+    step(f"Step 4 — Create auto-follow rules on SECONDARY ({cfg.secondary_url})")
     if started and autofollow_rules:
         _apply_autofollow_rules(
             cfg.secondary_url, cfg.primary_alias_on_secondary,
             autofollow_rules, cfg, action="create",
+            non_interactive=non_interactive,
         )
 
     ok("FAILBACK complete. Normal replication restored.")
