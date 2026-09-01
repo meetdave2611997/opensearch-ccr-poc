@@ -1,0 +1,11 @@
+{
+  "primary_url": "http://localhost:9200",
+  "secondary_url": "http://localhost:9201",
+  "indices_file": "./indices.json",
+  "primary_alias_on_secondary": "primary-cluster",
+  "secondary_alias_on_primary": "secondary-cluster",
+
+  "username": "",
+  "password": "",
+  "verify_ssl": true
+}
