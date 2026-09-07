@@ -1,149 +1,335 @@
 # OpenSearch DR Switchover — User Guide
 
-This guide is for people who have **never used this tool**. It explains the ideas first, then the config file, then every command you will run.
-
-The script you use is `[dr-switchover.py](dr-switchover.py)`. It failover and failback two OpenSearch clusters that already have **cross-cluster replication (CCR)** set up.
-
----
-
-## 1. What this is?
-
-You have two OpenSearch clusters:
-
-
-| Role          | Typical name        | Local Docker URL        | Meaning                                                                |
-| ------------- | ------------------- | ----------------------- | ---------------------------------------------------------------------- |
-| **PRIMARY**   | Production / leader | `http://localhost:9200` | The cluster that applications write to in the **normal** state         |
-| **SECONDARY** | DR / follower       | `http://localhost:9201` | A standby copy. It follows PRIMARY. Follower indices are **read-only** |
-
-
-**Cross-cluster replication (CCR)** copies index data from the leader to the follower.
-
-**Failover** = PRIMARY is down or you want to test DR. SECONDARY becomes the writable leader. PRIMARY (if it is still up) starts following SECONDARY.
-
-**Failback** = DR test is over. PRIMARY becomes the writable leader again. SECONDARY follows PRIMARY.
-
-```
-NORMAL (before failover)
-  PRIMARY (leader, R/W)  ──CCR──►  SECONDARY (follower, read-only)
-
-AFTER FAILOVER
-  SECONDARY (leader, R/W)  ──CCR──►  PRIMARY (follower, read-only)
-
-AFTER FAILBACK
-  PRIMARY (leader, R/W)  ──CCR──►  SECONDARY (follower, read-only)
-```
-
-The script never creates the AWS/OpenSearch **connection aliases**. Those must already exist. Locally, Docker `init/setup.sh` creates them for you.
+This guide explains how to run disaster-recovery switchovers between two existing
+OpenSearch clusters using `dr-switchover.py`.
 
 ---
 
+## 1. Prerequisites
 
+- Two AWS OpenSearch domains exist — one in `us-east-1`, one in `us-east-2`.
+- Cross-cluster connections between them (inbound + outbound) are provisioned
+  through Terraform and are in the `ACTIVE` state.
+- The script **never** creates, accepts, or modifies those connections. It only
+  drives the replication plugin on top of them.
+- Python 3.9+ with `requests` installed (`pip install -r requirements.txt`).
+- Network reachability to **both** domains from wherever you run the script. For
+  VPC-attached domains that means a bastion, workload host, or VPN — not a laptop.
+- A config file (or env vars / CLI flags) with both endpoints and both connection
+  alias names — see section 8.
 
-## 2. Files in this folder
+### The two connection aliases
 
+The script starts replication by referencing an OpenSearch **connection alias**
+that must already exist on the follower and point at the leader. Because
+replication runs in both directions over the lifetime of a DR event, you need one
+alias per direction:
 
-| File                                                                         | What it is                                                                     |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `[dr-switchover.py](dr-switchover.py)`                                       | The DR tool. Failover, failback, status.                                       |
-| `[indices.json](indices.json)`                                               | The list of indices and auto-follow rules the script manages.                  |
-| `[docker-compose.yml](docker-compose.yml)`                                   | Local PRIMARY + SECONDARY + Dashboards + init.                                 |
-| `[init/setup.sh](init/setup.sh)`                                             | First-time seed: creates indices, registers aliases, starts CCR.               |
-| `[requirements.txt](requirements.txt)`                                       | Python dependency (`requests`).                                                |
-| `[find-missing-replication-indices.py](find-missing-replication-indices.py)` | Optional helper: find indices on the leader that are missing on the follower.  |
-| `[generate_fake_indices.py](generate_fake_indices.py)`                       | Optional helper: create sample `sample-idx-*` indices for auto-follow testing. |
-| `[README.md](README.md)`                                                     | Short project overview. This GUIDE is the full walkthrough.                    |
+| Config key                   | Default value       | Registered on           | Points to               | Used by      |
+| ---------------------------- | ------------------- | ----------------------- | ----------------------- | ------------ |
+| `primary_alias_on_secondary` | `primary-cluster`   | `us-east-2` (SECONDARY) | `us-east-1` (PRIMARY)   | **Failback** |
+| `secondary_alias_on_primary` | `secondary-cluster` | `us-east-1` (PRIMARY)   | `us-east-2` (SECONDARY) | **Failover** |
 
+Set these to whatever alias names your Terraform created.
 
----
-
-
-
-## 3. Concepts you must know before editing `indices.json`
-
-The script splits every entry in `indices.json` into **exactly one** of two buckets:
-
-### Static index (explicit CCR)
-
-- Has `"name"` and `"autofollow": false` (or no `autofollow` field).
-- The script **stops, deletes, and starts replication by that exact name**.
-- Use this for a small, known set of indices (`orders`, `users`, `events`).
-
-
-
-### Auto-follow rule
-
-- Has `"autofollow": true` **and** a required `"autofollow_pattern"`.
-- OpenSearch watches the leader and **automatically starts replication** for any new index whose name matches the pattern (for example `products`* → `products`, `products-1`, `products-2`).
-- The script does **not** call explicit `_start` for those matching indices. The rule does that.
-- If an entry also has `"name"`, that name is only the **rule identifier** (no `*` or `?` allowed). It is **not** treated as a static index.
-
-**An index cannot be both.** If `autofollow` is `true`, it is auto-follow only — even if `name` is present.
-
-### Why auto-follow needs `autofollow_pattern`
-
-`name` is an identifier. `autofollow_pattern` is the wildcard OpenSearch matches.
-
-```
-name:               products          ← rule name sent to the API (no wildcards)
-autofollow_pattern: products*         ← matches products, products-1, products-2024, …
-```
-
-If you set `"autofollow": true` without `autofollow_pattern`, the script prints an error and **exits**.
+> **Verify both alias names before your first real run.** If an alias is wrong or
+> its connection is not `ACTIVE`, the run fails at the "start replication" step —
+> which happens *after* indices have already been deleted on the demoted cluster.
+> You would be left with a promoted cluster and no replication link.
 
 ---
 
+## 2. Leader, follower, and what "failover" actually means
 
+Cross-cluster replication (CCR) is one-directional. One cluster is the **leader**
+(read/write, applications point here), the other is the **follower** (a live copy
+whose replicated indices are read-only, enforced by index write blocks).
 
-## 4. `indices.json` structure
+In this tool, **failover and failback are not events — they are directions.**
+Each operation flips which cluster holds the leader role:
 
-Top level is always:
-
-```json
-{
-  "indices": [ ... entries ... ]
-}
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> STEADY: failback (initial bootstrap)
+    STEADY: STEADY STATE
+    STEADY: us-east-1 leader (R/W) — CCR — us-east-2 follower (read-only)
+    DR: DR STATE
+    DR: us-east-2 leader (R/W) — CCR — us-east-1 follower (read-only)
+    STEADY --> DR: failover
+    DR --> STEADY: failback
 ```
 
+Throughout the script and this guide:
 
+| Term          | Means                                                              | Your setup  |
+| ------------- | ------------------------------------------------------------------ | ----------- |
+| **PRIMARY**   | The cluster that is the leader in the normal, steady state         | `us-east-1` |
+| **SECONDARY** | The DR cluster that follows PRIMARY in the normal, steady state    | `us-east-2` |
 
-### Fields
+These labels are fixed to a region, not to the current role. `us-east-1` stays
+"PRIMARY" in config even while it is temporarily a follower during a DR event.
+That is why you must always check `status` before acting — the label does not
+tell you the live direction.
 
+---
 
-| Field                 | Required?                                    | Used for                                            | Notes                               |
-| --------------------- | -------------------------------------------- | --------------------------------------------------- | ----------------------------------- |
-| `name`                | Static: **yes**. Auto-follow: optional       | Static index name, **or** auto-follow rule name     | Must not contain `*` or `?`         |
-| `autofollow`          | No (default `false`)                         | Route: static vs auto-follow                        | `true` = auto-follow only           |
-| `autofollow_pattern`  | **Required when** `autofollow` **is** `true` | Wildcard matched on the leader                      | Example: `products`*, `logs-2026-*` |
-| `description`         | No                                           | Human note only                                     | Ignored by the script               |
-| `shards` / `replicas` | No                                           | Used by local `init/setup.sh` when creating indices | Ignored by `dr-switchover.py`       |
+## 3. Operations
 
+The script supports exactly three operations.
 
+```bash
+python3 dr-switchover.py --operation status     # read-only inspection
+python3 dr-switchover.py --operation failover   # make us-east-2 the leader
+python3 dr-switchover.py --operation failback   # make us-east-1 the leader
+python3 dr-switchover.py                        # interactive menu (1/2/3/4)
+```
 
+| Operation    | Effect                                                                    | Destructive |
+| ------------ | ------------------------------------------------------------------------- | ----------- |
+| **status**   | Prints health, per-index CCR state, write blocks, auto-follow stats       | No          |
+| **failover** | Promotes SECONDARY to leader; PRIMARY becomes the follower                 | Yes         |
+| **failback** | Promotes PRIMARY to leader; SECONDARY becomes the follower                | Yes         |
 
-### Shape A — Static index (explicit replication)
+`status` is safe to run at any time and is the only way to know the live
+direction. Read it as follows: whichever cluster shows `SYNCING` and has write
+blocks on the managed indices is the **follower**; the other is the leader.
+
+---
+
+## 4. Stages of a switchover, and where you are asked for input
+
+Failover and failback are the **same three stages**, applied to opposite clusters.
+Stage 1 promotes one cluster to leader; stages 2–3 demote the other and rebuild
+replication in the new direction.
+
+| Operation    | PROMOTED (stage 1)      | DEMOTED (stages 2–3)    |
+| ------------ | ----------------------- | ----------------------- |
+| **failover** | `us-east-2` (SECONDARY) | `us-east-1` (PRIMARY)   |
+| **failback** | `us-east-1` (PRIMARY)   | `us-east-2` (SECONDARY) |
+
+```mermaid
+flowchart TD
+    S1["STAGE 1 — STOP REPLICATION<br/>on PROMOTED cluster<br/>static indices + auto-follow rules<br/>clear write blocks"]
+    CUT["PROMOTED CLUSTER IS NOW WRITABLE<br/>cut application traffic here"]
+    VAL{{"VALIDATE DATA NOW<br/>before anything is deleted"}}
+    S2["STAGE 2 — CLEAN UP<br/>on DEMOTED cluster<br/>delete managed indices<br/>(prerequisite for stage 3)"]
+    S3["STAGE 3 — SET UP REPLICATION<br/>on DEMOTED cluster<br/>start static CCR + recreate auto-follow rules<br/>following the new leader"]
+    DONE(["Run --operation status<br/>DEMOTED cluster should show SYNCING"])
+
+    S1 -- "prompts: [y/N] · n aborts everything" --> CUT
+    CUT --> VAL
+    VAL -- "data looks right" --> S2
+    S2 -- "prompt: type DELETE<br/>anything else aborts stages 2-3 only" --> S3
+    S3 --> DONE
+
+    style CUT fill:#fff3cd,stroke:#856404,color:#000
+    style VAL fill:#d1ecf1,stroke:#0c5460,color:#000
+    style S2 fill:#f8d7da,stroke:#721c24,color:#000
+```
+
+### Stage 1 — Stop replication on the cluster being promoted
+
+This stage makes the promoted cluster writable. It covers **both** index types:
+
+- **Static indices** — calls `_stop` on each, then clears `blocks.write`,
+  `blocks.read_only`, and `blocks.read_only_allow_delete`.
+- **Auto-follow rules** — for each rule, discovers every live index matching the
+  pattern, stops replication and clears write blocks on each, then deletes the
+  rule itself.
+
+Auto-follow needs that per-index sweep because deleting a rule in OpenSearch only
+stops *new* indices from being picked up. Indices the rule already created stay
+read-only and keep replicating, so without this they would remain unwritable
+after promotion.
+
+**Prompts:** one `[y/N]` for the static indices, one `[y/N]` for the auto-follow
+rules. Each appears only when that type is configured.
+**Can you skip them?** No — answering `n` aborts the whole operation. Skipping
+only makes sense if replication was already stopped by hand, in which case the
+calls are no-ops anyway (already-stopped and 404 responses count as success).
+
+If a write block fails to clear you get an extra `Proceed anyway?` prompt. Answer
+`y` only after reading the errors — an index that stays blocked will not accept
+application writes even though the operation reports success.
+
+Once this stage finishes, the script prints that the promoted cluster is active
+and writable. **This is where you cut application traffic over.** Stages 2–3 only
+rebuild replication in the reverse direction and can be run later if needed.
+
+> ### Validate before you let stage 2 delete anything
+>
+> Stage 1 has stopped replication but nothing has been destroyed yet. This is the
+> **only safe window** to check that the promoted cluster actually holds the data
+> you expect — document counts, newest timestamps, a few spot-check queries
+> against the indices your teams care about.
+>
+> ```bash
+> curl "$PROMOTED_URL/_cat/indices?v&s=index"
+> curl "$PROMOTED_URL/orders/_count"
+> curl "$PROMOTED_URL/orders/_search?size=1&sort=@timestamp:desc"
+> ```
+>
+> Also confirm with the **owning teams** that they accept resync by delete-and-reseed.
+> Stage 2 does not merge or reconcile: the demoted cluster's copy is thrown away
+> and rebuilt from the promoted cluster. Any writes that landed only on the demoted
+> cluster — for example during a split-brain window, or writes an application made
+> to it before traffic was cut over — are lost with no way to recover them from CCR.
+> If a team needs those writes, snapshot the demoted cluster or export the affected
+> indices **before** you continue.
+>
+> If the data does not look right, stop here. A writable promoted cluster with no
+> replication is a valid state to sit in while you investigate.
+
+### Stage 2 — Clean up indices on the cluster being demoted
+
+CCR cannot start on a follower index that already exists. The cluster being
+demoted still holds its own copy of every managed index from when it was the
+leader, so those copies must be deleted before stage 3 can establish replication
+in the new direction. **Stage 2 exists purely as a prerequisite for stage 3** —
+without it, stage 3 cannot run.
+
+What gets collected into the delete list:
+
+- Each static index. If one is still an active CCR follower (`SYNCING`,
+  `BOOTSTRAPPING`, `PAUSED`) it is stopped and unblocked first so it can be deleted.
+- Every index on that cluster matching each configured auto-follow pattern.
+
+**Prompt:** the full list of indices to be deleted, then
+`Type DELETE (uppercase) to confirm`. A typed word is required so an accidental
+Enter can never trigger data loss — this is the single destructive part of both
+operations.
+**Can you skip it?** Yes — anything other than `DELETE` aborts *stages 2–3 only*.
+The promotion from stage 1 stands, and you are left with a writable promoted
+cluster and no replication. That is a legitimate state during a real incident;
+you can run the operation again later to establish replication.
+
+At this moment the promoted cluster is the **only** source of truth. Never type
+`DELETE` before completing the validation above.
+
+### Stage 3 — Set up replication on the cluster being demoted
+
+With the demoted cluster cleared, replication is established in the new direction.
+Again both index types are covered:
+
+- **Static indices** — explicit `_start` per index against the new leader's
+  connection alias, with up to `retry_max_attempts` tries and exponential backoff.
+- **Auto-follow rules** — each configured rule is recreated on the demoted cluster
+  pointing at the new leader. OpenSearch then picks up matching indices itself, so
+  the script deliberately does not `_start` those individually.
+
+Rule creation is idempotent: a rule that already exists with the same pattern is
+skipped, and one that exists with a *different* pattern triggers a prompt —
+`Replace existing auto-follow rule 'x' (pattern: 'old' → 'new')?`. Answer `y` only
+if you intentionally changed the pattern in your indices file.
+
+Rule recreation runs only if the deletes and static starts succeeded.
+
+---
+
+## 5. Running a real DR event
+
+Your steady state is `us-east-1` as leader. That direction is established by a
+**failback** — which is also how you bootstrap replication for the first time.
+
+| Situation                                                 | Operation to run |
+| --------------------------------------------------------- | ---------------- |
+| Initial setup / bootstrap replication into `us-east-2`     | `failback`       |
+| `us-east-1` is down or degraded — activate DR              | `failover`       |
+| Planned DR drill                                           | `failover`       |
+| `us-east-1` is healthy again — return to steady state      | `failback`       |
+
+### The actual DR sequence
+
+```mermaid
+flowchart TD
+    A(["us-east-1 is down or a drill starts"]) --> B["--operation status<br/>confirm the live direction first"]
+    B --> C["--operation failover"]
+    C --> D["Stage 1 prompts: y<br/>replication stopped on us-east-2"]
+    D --> E["Cut application traffic to us-east-2"]
+    E --> V{{"Validate data on us-east-2<br/>confirm teams accept delete-and-reseed"}}
+    V --> F{"Is us-east-1 reachable?"}
+    F -- yes --> G["Stage 2: type DELETE<br/>Stage 3: y if prompted about a pattern"]
+    F -- "no (down)" --> H["Deletes will fail — expected.<br/>Abort stage 2, run on DR only"]
+    G --> I["--operation status<br/>us-east-1 shows SYNCING<br/>us-east-2 has no blocks"]
+    H --> J(["us-east-2 writable, NO replication link"])
+    I --> K(["DR STATE, replication reversed and healthy"])
+
+    style E fill:#fff3cd,stroke:#856404,color:#000
+    style V fill:#d1ecf1,stroke:#0c5460,color:#000
+    style J fill:#f8d7da,stroke:#721c24,color:#000
+```
+
+### Resyncing data back to `us-east-1`
+
+`us-east-2` accumulated writes while it was the leader. Which path you take
+depends on whether stages 2–3 of the failover completed:
+
+```mermaid
+flowchart TD
+    Q{"Did stages 2-3 of the failover succeed?"}
+    Q -- "yes — us-east-1 has been<br/>following us-east-2 all along" --> Y1["--operation failback"]
+    Y1 --> Y2["Cut traffic back at end of stage 1<br/>validate, then type DELETE in stage 2<br/>(deletes hit us-east-2)"]
+    Y2 --> DONE(["STEADY STATE restored"])
+
+    Q -- "no — us-east-1 holds stale data<br/>and there is no replication link" --> N1["--operation failover again<br/>stage 1 is a no-op on the writable us-east-2<br/>stages 2-3 reseed us-east-1 from current data"]
+    N1 --> N2["Wait for --operation status to show<br/>SYNCING, not BOOTSTRAPPING"]
+    N2 --> Y1
+
+    style N1 fill:#fff3cd,stroke:#856404,color:#000
+```
+
+Running `failback` directly in the second case would promote the stale cluster —
+that is the mistake this branch exists to prevent.
+
+Use `find-missing-replication-indices.py` if you suspect individual indices were
+never replicated — it diffs both clusters and emits ready-to-run `curl` commands
+to start CCR for whatever is missing.
+
+```bash
+python3 find-missing-replication-indices.py --config ./config.json \
+  --direction secondary-to-primary
+```
+
+---
+
+## 6. Index types the script supports
+
+Every entry in the indices file becomes **exactly one** of two things. There is no
+overlap: if `autofollow` is `true`, the entry is an auto-follow rule only, even if
+it has a `name`.
+
+### Static index — explicit, named replication
+
+An index you replicate by exact name. Use this for a small, stable set.
 
 ```json
 {
   "name": "orders",
   "description": "Customer orders",
-  "shards": 1,
-  "replicas": 0,
   "autofollow": false
 }
 ```
 
-What the script does:
+The script stops, unblocks, deletes, and issues `_start` for this exact name.
+Static indices are the only ones that appear in the per-index tables in `status`.
 
-- Failover Step 1: stop CCR + remove write blocks on SECONDARY for `orders`.
-- Failover Step 3: delete `orders` on PRIMARY, then `_start` replication from SECONDARY.
-- Failback does the reverse.
+### Auto-follow rule — pattern-based replication
 
+OpenSearch watches the leader and automatically starts replication for any index
+whose name matches the pattern. Use this for index families that grow over time.
 
+`autofollow_pattern` is **required** whenever `autofollow` is `true`, and is never
+inferred from `name`. Missing it is a fatal error — the script exits.
 
-### Shape B — Named auto-follow rule (recommended)
+The two fields do different jobs:
 
-Use this when you have a family of indices and want a readable rule name.
+```
+name:               metrics-idx      ← rule identifier sent to OpenSearch, no wildcards
+autofollow_pattern: metrics-idx*     ← wildcard matched against leader index names
+```
+
+With a rule name:
 
 ```json
 {
@@ -154,223 +340,85 @@ Use this when you have a family of indices and want a readable rule name.
 }
 ```
 
-What the script does:
-
-- Does **not** put `products` in the static index list.
-- Creates/deletes one OpenSearch auto-follow rule named `products` with pattern `products*`.
-- On rule delete: finds every live index matching `products*` on that cluster, stops CCR, removes write blocks, then deletes the rule.
-- On role change: discovers matching indices on the new follower, includes them in the destructive delete list, then recreates the rule so OpenSearch re-follows them.
-
-
-
-### Shape C — Auto-follow only (no `name`)
-
-Use this when there is no single “base” index — only a pattern.
+Without one — the rule name is derived by stripping `*` and `?` from the pattern
+and trimming trailing `-`/`_`, so `metrics-idx*` becomes rule `metrics-idx`:
 
 ```json
 {
-  "description": "Metrics index family (metrics-idx-01 … metrics-idx-50)",
+  "description": "Metrics family",
   "autofollow": true,
   "autofollow_pattern": "metrics-idx*"
 }
 ```
 
-The rule name is derived by stripping `*` and `?` from the pattern:
+The script does not call `_start` for pattern-matched indices. The rule does that.
+The script's job is to tear the rule down on the promoted cluster (stage 1) and
+recreate it on the demoted cluster (stage 3).
 
-`metrics-idx*` → rule name `metrics-idx`
+---
 
-### Mixed file (the usual production case)
+## 7. The indices file
+
+Default path `./indices.json`, overridable with `--indices-file`,
+`OPENSEARCH_INDICES_FILE`, or `indices_file` in the config file. It is read fresh
+on every run — no restart or cache to worry about.
 
 ```json
 {
   "indices": [
-    {
-      "name": "orders",
-      "description": "Customer orders — explicit CCR",
-      "autofollow": false
-    },
-    {
-      "name": "users",
-      "description": "User profiles — explicit CCR",
-      "autofollow": false
-    },
-    {
-      "name": "events",
-      "description": "Event logs — explicit CCR",
-      "autofollow": false
-    },
-    {
-      "name": "products",
-      "description": "Product family — auto-follow",
-      "autofollow": true,
-      "autofollow_pattern": "products*"
-    },
-    {
-      "description": "Metrics family — auto-follow only",
-      "autofollow": true,
-      "autofollow_pattern": "metrics-idx*"
-    }
+    { "name": "orders",   "description": "Customer orders",  "autofollow": false },
+    { "name": "users",    "description": "User profiles",    "autofollow": false },
+    { "name": "products", "description": "Product family",
+      "autofollow": true, "autofollow_pattern": "products*" },
+    { "description": "Metrics family",
+      "autofollow": true, "autofollow_pattern": "metrics-idx*" }
   ]
 }
 ```
 
-How the script reads that file:
+| Field                 | Required                              | Purpose                                       | Notes                            |
+| --------------------- | ------------------------------------- | --------------------------------------------- | -------------------------------- |
+| `name`                | Static: yes. Auto-follow: optional    | Static index name, or auto-follow rule name   | Must not contain `*` or `?`      |
+| `autofollow`          | No (defaults to `false`)              | Chooses static vs auto-follow                 | `true` = auto-follow only        |
+| `autofollow_pattern`  | Yes when `autofollow` is `true`       | Wildcard matched on the leader                | e.g. `products*`, `logs-2026-*`  |
+| `description`         | No                                    | Human note                                    | Ignored by the script            |
+| `shards` / `replicas` | No                                    | Not used                                      | Ignored by the script            |
 
+The file above resolves to:
 
-| Bucket                                           | Entries                                                  |
-| ------------------------------------------------ | -------------------------------------------------------- |
-| Static indices (`--operation` Step 1 / `_start`) | `orders`, `users`, `events`                              |
-| Auto-follow rules                                | `products` → `products*`, `metrics-idx` → `metrics-idx*` |
+| Bucket           | Entries                                                  |
+| ---------------- | -------------------------------------------------------- |
+| Static indices   | `orders`, `users`                                        |
+| Auto-follow rules| `products` → `products*`, `metrics-idx` → `metrics-idx*` |
 
+At least one static index **or** one valid auto-follow rule is required; an
+otherwise empty file is a fatal error.
 
-At least one static index **or** one valid auto-follow rule is required. An empty file is an error.
+### Changing the managed set
 
----
-
-
-
-## 5. One-time setup
-
-
-
-### Local Docker (learning / POC)
-
-You need Docker Desktop (or Docker Engine + Compose).
-
-```bash
-cd infra/opensearch-ccr-poc
-
-# Start both clusters + Dashboards + init
-docker compose up -d
-
-# Watch first-time setup (creates indices, aliases, starts CCR)
-docker logs -f opensearch-init
-```
-
-Wait until setup prints `Setup complete!` (~2 minutes).
-
-
-| Service              | URL                                            |
-| -------------------- | ---------------------------------------------- |
-| PRIMARY OpenSearch   | [http://localhost:9200](http://localhost:9200) |
-| SECONDARY OpenSearch | [http://localhost:9201](http://localhost:9201) |
-| PRIMARY Dashboards   | [http://localhost:5601](http://localhost:5601) |
-| SECONDARY Dashboards | [http://localhost:5602](http://localhost:5602) |
-
-
-Init registers these aliases (the script expects the same names by default):
-
-
-| Alias               | Created on | Points to | Used during                          |
-| ------------------- | ---------- | --------- | ------------------------------------ |
-| `primary-cluster`   | SECONDARY  | PRIMARY   | Failback (SECONDARY follows PRIMARY) |
-| `secondary-cluster` | PRIMARY    | SECONDARY | Failover (PRIMARY follows SECONDARY) |
-
-
-Tear down (destroys data):
-
-```bash
-docker compose down -v
-```
-
-
-
-### AWS OpenSearch (real environments)
-
-Do this **once** in the AWS console before running the script:
-
-1. Open **OpenSearch → Domains → Cross-cluster search / connections**.
-2. On the **SECONDARY** domain, create an outbound connection to PRIMARY. Alias: `primary-cluster` (or whatever you pass as `--primary-alias`).
-3. On the **PRIMARY** domain, create an outbound connection to SECONDARY. Alias: `secondary-cluster` (or `--secondary-alias`).
-4. Accept both connections.
-5. Put both domain endpoints and the same aliases into CLI flags, env vars, or `config.json`.
-
-The script will **not** create or accept those connections.
-
-### Python environment
-
-```bash
-cd infra/opensearch-ccr-poc
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
+Removing an entry only stops the script from managing it. Existing CCR or
+auto-follow rules on the clusters are not cleaned up until you remove them by
+hand. Adding a static index means creating it on the current leader and starting
+CCR once on the follower — the script's `_start` calls only run during a
+switchover.
 
 ---
 
+## 8. Configuration
 
-
-## 6. How to run the script
-
-```bash
-cd infra/opensearch-ccr-poc
-source .venv/bin/activate
-
-# Interactive menu (recommended the first time)
-python3 dr-switchover.py
-
-# Direct operations
-python3 dr-switchover.py --operation status
-python3 dr-switchover.py --operation failover
-python3 dr-switchover.py --operation failback
-```
-
-Menu choices:
-
-
-| Choice | Operation                                             |
-| ------ | ----------------------------------------------------- |
-| 1      | Failover — activate DR site                           |
-| 2      | Failback — restore normal state                       |
-| 3      | Status — health, CCR, write blocks, auto-follow stats |
-| 4      | Quit                                                  |
-
-
-
-
-### Pointing at real clusters
-
-```bash
-python3 dr-switchover.py \
-  --primary-url    https://search-primary.example.com \
-  --secondary-url  https://search-secondary.example.com \
-  --indices-file   ./indices.json \
-  --primary-alias  primary-cluster \
-  --secondary-alias secondary-cluster \
-  --operation status
-```
-
-
-
-### Configuration precedence (highest wins)
+Precedence, highest wins:
 
 1. CLI flags
 2. Environment variables
-3. `config.json` (`--config path/to/config.json`)
-4. Built-in localhost defaults
+3. Config file (`--config path/to/config.json`)
+4. Built-in defaults
 
-**Environment variables**
-
-
-| Variable                     | Meaning                         | Default                 |
-| ---------------------------- | ------------------------------- | ----------------------- |
-| `OPENSEARCH_PRIMARY_URL`     | PRIMARY URL                     | `http://localhost:9200` |
-| `OPENSEARCH_SECONDARY_URL`   | SECONDARY URL                   | `http://localhost:9201` |
-| `OPENSEARCH_INDICES_FILE`    | Path to `indices.json`          | `./indices.json`        |
-| `OPENSEARCH_PRIMARY_ALIAS`   | Alias on SECONDARY → PRIMARY    | `primary-cluster`       |
-| `OPENSEARCH_SECONDARY_ALIAS` | Alias on PRIMARY → SECONDARY    | `secondary-cluster`     |
-| `OPENSEARCH_USERNAME`        | Basic auth user                 | (empty)                 |
-| `OPENSEARCH_PASSWORD`        | Basic auth password             | (empty)                 |
-| `OPENSEARCH_RETRY_MAX`       | Max `_start` attempts per index | `3`                     |
-| `OPENSEARCH_RETRY_DELAY`     | Base backoff seconds            | `2.0`                   |
-
-
-**Example** `config.json`
+A config file is the practical choice for two fixed regions.
 
 ```json
 {
-  "primary_url": "https://search-primary.example.com",
-  "secondary_url": "https://search-secondary.example.com",
+  "primary_url": "https://vpc-search-use1.us-east-1.es.amazonaws.com",
+  "secondary_url": "https://vpc-search-use2.us-east-2.es.amazonaws.com",
   "indices_file": "./indices.json",
   "primary_alias_on_secondary": "primary-cluster",
   "secondary_alias_on_primary": "secondary-cluster",
@@ -382,236 +430,100 @@ python3 dr-switchover.py \
 }
 ```
 
----
+| Key                          | Meaning                                              | Default                 |
+| ---------------------------- | ---------------------------------------------------- | ----------------------- |
+| `primary_url`                | Endpoint of the steady-state leader (`us-east-1`)    | —                       |
+| `secondary_url`              | Endpoint of the DR cluster (`us-east-2`)             | —                       |
+| `indices_file`               | Path to the indices file                             | `./indices.json`        |
+| `primary_alias_on_secondary` | Alias on SECONDARY → PRIMARY (failback)              | `primary-cluster`       |
+| `secondary_alias_on_primary` | Alias on PRIMARY → SECONDARY (failover)              | `secondary-cluster`     |
+| `username` / `password`      | Basic auth, if the domains use it                    | empty                   |
+| `verify_ssl`                 | TLS verification                                     | `true`                  |
+| `retry_max_attempts`         | `_start` attempts per index                          | `3`                     |
+| `retry_base_delay`           | Base backoff seconds between attempts                | `2.0`                   |
 
+Equivalent environment variables: `OPENSEARCH_PRIMARY_URL`,
+`OPENSEARCH_SECONDARY_URL`, `OPENSEARCH_INDICES_FILE`,
+`OPENSEARCH_PRIMARY_ALIAS`, `OPENSEARCH_SECONDARY_ALIAS`,
+`OPENSEARCH_USERNAME`, `OPENSEARCH_PASSWORD`, `OPENSEARCH_RETRY_MAX`,
+`OPENSEARCH_RETRY_DELAY`.
 
-
-## 7. Operations in detail
-
-Always run **status first** so you know which cluster is currently the follower.
-
-```bash
-python3 dr-switchover.py --operation status
-```
-
-What you should see in the **normal** state:
-
-- SECONDARY: static indices `status=SYNCING`, write blocks present (CCR read-only).
-- PRIMARY: those same indices have no replication (they are the leader).
-- Auto-follow stats on SECONDARY list your rules (`products=products*`, etc.).
-
----
-
-
-
-### 7.1 Status
-
-Read-only. Does not change either cluster.
-
-Shows:
-
-- Cluster health for PRIMARY and SECONDARY
-- CCR status per **static** index on both sides (`SYNCING`, `BOOTSTRAPPING`, `PAUSED`, or HTTP error)
-- Write / read-only blocks per static index
-- Auto-follow stats (success/fail counts, failed index names) when rules exist
-
-Auto-follow-matched indices (`products-1`, `metrics-idx-03`, …) do not appear in the per-index table. They appear under auto-follow stats and in the failover/failback teardown lists.
-
----
-
-
-
-### 7.2 Failover — activate the DR site
-
-**When to use:** PRIMARY is unavailable, or you are running a planned DR test.
-
-**Prerequisite:** You are in the **normal** state (SECONDARY is following PRIMARY). Do **not** run failover twice in a row without failback, unless you understand you are reversing direction again.
+The script must run from somewhere that can reach both domains — if they are
+VPC-attached, that means a bastion, workload host, or VPN, not a laptop.
 
 ```bash
-python3 dr-switchover.py --operation failover
-```
-
-
-| Step | What happens                                                                                                                                                                                                                          | Confirmation                           |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| 1    | Stop CCR + remove write blocks on SECONDARY for **static** indices only                                                                                                                                                               | `y/N` if there are static indices      |
-| 2    | Discover all indices matching each auto-follow pattern on SECONDARY, stop CCR, remove write blocks, delete the rules                                                                                                                  | `y/N` if there are auto-follow rules   |
-| —    | SECONDARY is now writable. DR testing can begin.                                                                                                                                                                                      | —                                      |
-| 3    | On PRIMARY: if any static index is still a CCR follower, stop + unblock it. Discover auto-follow matches. Ask you to type `DELETE`. Delete those indices. Start explicit CCR for **static** indices only (PRIMARY follows SECONDARY). | Type `DELETE` (uppercase)              |
-| 4    | Create auto-follow rules on PRIMARY (now the follower). If a rule already exists with the same pattern, it is skipped. If the pattern differs, you are asked whether to replace it.                                                   | Replace prompt only if pattern changed |
-
-
-**Destructive Step 3** permanently deletes the listed indices on the **new follower** (PRIMARY during failover). That is required: CCR cannot start if the follower index already exists. Confirm the **leader** (SECONDARY after Step 1) has the data you care about before typing `DELETE`.
-
----
-
-
-
-### 7.3 Failback — restore the normal state
-
-**When to use:** After a successful failover and DR test. Applications should be ready to write to PRIMARY again.
-
-```bash
-python3 dr-switchover.py --operation failback
-```
-
-Same four-step shape, opposite direction:
-
-
-| Step | Cluster acted on                                                                 |
-| ---- | -------------------------------------------------------------------------------- |
-| 1    | Stop static CCR on PRIMARY, make those indices R/W                               |
-| 2    | Tear down auto-follow on PRIMARY (stop matching followers, delete rules)         |
-| 3    | Delete listed indices on SECONDARY, start static CCR (SECONDARY follows PRIMARY) |
-| 4    | Recreate auto-follow rules on SECONDARY                                          |
-
-
----
-
-
-
-## 8. What you will be asked to confirm
-
-
-| Prompt             | Typical text                                                             | How to proceed                               |
-| ------------------ | ------------------------------------------------------------------------ | -------------------------------------------- |
-| Step 1             | `Stop replication for N index(es) on SECONDARY/PRIMARY … [y/N]`          | Type `y`                                     |
-| Step 2             | `Delete N auto-follow rule(s) from SECONDARY/PRIMARY … [y/N]`            | Type `y`                                     |
-| Step 3             | `Type DELETE (uppercase) to confirm`                                     | Type `DELETE`                                |
-| Rule replace       | `Replace existing auto-follow rule 'products' (pattern: 'old' → 'new')?` | `y` only if you intend to change the pattern |
-| Write-block errors | `Proceed anyway?`                                                        | Only if you reviewed the errors              |
-
-
-`--non-interactive` auto-confirms every prompt (including `DELETE`). Use only in CI or when you are certain.
-
-`--dry-run` skips confirmations and does not mutate the cluster. GET calls (status) still run.
-
-```bash
-python3 dr-switchover.py --dry-run --operation failover --non-interactive
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python3 dr-switchover.py --config ./config.json --operation status
 ```
 
 ---
 
+## 9. Rehearsal and automation flags
 
+| Flag                | Behaviour                                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--dry-run`         | Logs every `POST`/`PUT`/`DELETE` it *would* send and skips all confirmations. `GET`s still run, so discovery and status are real. Nothing is mutated. |
+| `--non-interactive` | Auto-confirms every prompt, **including the typed `DELETE`**. For CI only.                                     |
+| `--no-colour`       | Strips ANSI codes — useful when piping to a log.                                                              |
 
-## 9. Recommended first-time practice (local)
-
-Do this on Docker before you touch a real domain.
-
-1. Start clusters (`docker compose up -d`) and wait for init.
-2. Install Python deps (section 5).
-3. Edit `indices.json` so every `"autofollow": true` entry has `autofollow_pattern` (section 4).
-4. Preview:
-  ```bash
-   python3 dr-switchover.py --dry-run --operation failover --non-interactive
-  ```
-5. Check live state:
-  ```bash
-   python3 dr-switchover.py --operation status
-  ```
-6. Failover, then status again. SECONDARY should be the leader. PRIMARY should show `SYNCING` for static indices. Auto-follow rules should appear on PRIMARY.
-7. Optionally create extra matching indices on the **new leader** to watch auto-follow pick them up:
-  ```bash
-   curl -X PUT http://localhost:9201/products-1
-   curl -X PUT http://localhost:9201/products-2
-   # wait a few seconds, then:
-   curl http://localhost:9200/_cat/indices/products*?v
-  ```
-8. Failback, then status again. You should be back to PRIMARY → SECONDARY.
-9. If something looks wrong, do **not** guess a second failover. Run status, read the errors, then decide.
-
----
-
-
-
-## 10. Adding, changing, or removing indices
-
-Edit `indices.json`. The script reads it on every run. You do not restart Docker for script changes.
-
-### Add a static index
-
-1. Add a Shape A entry.
-2. Create the index on the **current leader** (PRIMARY in the normal state).
-3. Start CCR once on the follower (init does this for named indices on first boot; on an existing cluster start it yourself or use `[find-missing-replication-indices.py](find-missing-replication-indices.py)`).
-
-
-
-### Add an auto-follow family
-
-1. Add a Shape B or C entry with `autofollow_pattern`.
-2. Create matching indices on the **current leader**.
-3. Run failover or failback (or create the rule yourself). After the next switch, the script creates the rule on the new follower.
-
-
-
-### Remove an index from management
-
-Delete its entry from `indices.json`. The script will no longer stop/start it. Existing CCR or auto-follow rules on the cluster are **not** removed until you run a switch (or delete them manually).
-
----
-
-## 11. Troubleshooting
-
-
-| What you see                                                     | Likely cause                                                              | What to do                                                                                             |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `autofollow: true requires 'autofollow_pattern'`                 | Missing pattern                                                           | Add `autofollow_pattern` or set `autofollow` to `false`                                                |
-| `indices.json has no named indices and no autofollow rules`      | Empty or all-invalid file                                                 | Fix the file                                                                                           |
-| Connection / timeout errors                                      | Cluster down or wrong URL                                                 | Check Docker / VPC / `--primary-url`                                                                   |
-| Alias errors when starting replication                           | Connection alias missing                                                  | Create `primary-cluster` / `secondary-cluster` (section 5)                                             |
-| HTTP 403 `FORBIDDEN/1000` on delete                              | Index is still a CCR follower                                             | The script should stop + unblock and retry. If it still fails, stop replication manually then delete   |
-| Failover Step 3 lists only static indices, not `products-*`      | Those indices do not exist on the target cluster, or the pattern is wrong | Confirm names with `_cat/indices` and the pattern in `indices.json`                                    |
-| Auto-follow rule already exists                                  | Same name already registered                                              | Same pattern → skipped. Different pattern → you are prompted to replace                                |
-| Status shows `SYNCING` on the cluster you thought was the leader | You are already in the DR (or reversed) state                             | Run the **other** operation (failback vs failover). Do not assume “failover” is always next            |
-| Second failover without failback                                 | PRIMARY is already a follower                                             | The script should detect CCR and stop it before delete. Prefer failback to return to normal            |
-| Init started CCR for an auto-follow `name`                       | `setup.sh` starts CCR for every `"name"` in JSON                          | That is local-seed behavior. The switchover script still treats `autofollow: true` as auto-follow only |
-
-
-Manual stop + unblock (last resort):
+Always rehearse a new config or a changed indices file with a dry run first:
 
 ```bash
-curl -X POST http://localhost:9201/_plugins/_replication/orders/_stop -H 'Content-Type: application/json' -d '{}'
-curl -X PUT  http://localhost:9201/orders/_settings -H 'Content-Type: application/json' \
+python3 dr-switchover.py --config ./config.json --dry-run --operation failover
+```
+
+---
+
+## 10. Troubleshooting
+
+| Symptom                                                       | Cause                                                    | Action                                                                                     |
+| ------------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `autofollow: true requires 'autofollow_pattern'`              | Pattern missing on an auto-follow entry                  | Add `autofollow_pattern`, or set `autofollow` to `false`                                    |
+| `indices.json has no named indices and no autofollow rules`   | Empty or fully invalid indices file                      | Fix the file                                                                               |
+| Alias / remote-cluster error at the `_start` step             | Alias name wrong, or the connection is not `ACTIVE`      | Check the Terraform-managed connections and the two alias config keys (section 1)          |
+| HTTP 403 `FORBIDDEN/1000` on delete                           | Index is still a CCR follower                            | The script stops and unblocks before retrying; if it persists, stop replication manually   |
+| Stage 2 lists only static indices, not the pattern-matched    | Pattern is wrong, or those indices don't exist there     | Verify with `_cat/indices` and check the pattern                                           |
+| `status` shows `SYNCING` on the cluster you thought was leader | You are already in the reversed state                    | Run the *other* operation. Never assume failover is the next step                          |
+| `BOOTSTRAPPING` for a long time                               | Initial snapshot copy still in progress                  | Wait, and watch shard/index size. Do not start another switchover mid-bootstrap            |
+| Connection timeouts                                           | No network path from where you are running the script    | Run from inside the VPC, or connect via VPN                                                |
+
+Manual stop and unblock, as a last resort:
+
+```bash
+curl -X POST "$URL/_plugins/_replication/orders/_stop" \
+  -H 'Content-Type: application/json' -d '{}'
+
+curl -X PUT "$URL/orders/_settings" -H 'Content-Type: application/json' \
   -d '{"index":{"blocks.write":null,"blocks.read_only":null,"blocks.read_only_allow_delete":null}}'
 ```
 
 ---
 
+## 11. Safety rules
 
-
-## 12. Safety rules
-
-1. Run `--operation status` before every failover or failback.
-2. Preview with `--dry-run` the first time you use a new `indices.json` or new endpoints.
-3. Step 3 **deletes** indices on the new follower. Type `DELETE` only after you confirm the other cluster is the good copy.
-4. Do not use `--non-interactive` against production until you have practiced locally.
-5. After failover, send application writes to **SECONDARY**. After failback, send them back to **PRIMARY**.
-6. Auto-follow only stops **new** matching indices when you delete a rule. This script also stops existing matching followers so they become writable. Do not skip Step 2.
+1. Run `--operation status` before every failover and failback. The PRIMARY/SECONDARY
+   labels describe your config, not the live direction.
+2. Dry-run any new config file, endpoint, or indices file before using it for real.
+3. Validate data on the promoted cluster after stage 1 and before stage 2, and
+   confirm the owning teams accept resync by delete-and-reseed. Stage 2 discards
+   the demoted cluster's copy; writes that exist only there cannot be recovered.
+4. Stage 2 deletes indices. Type `DELETE` only after confirming the other cluster
+   is healthy and holds the data you intend to keep.
+5. Move application traffic at the end of stage 1, not at the end of the run.
+6. Never run `--non-interactive` against a production domain unless the whole
+   sequence has been rehearsed with the same config. It auto-confirms the typed
+   `DELETE`, so no one gets a chance to validate.
+7. Do not start a second switchover while indices are still `BOOTSTRAPPING`.
 
 ---
 
+## 12. Approach per team
 
+Which teams use which replication approach for their indices.
 
-## 13. Quick command cheat sheet
-
-```bash
-# Setup (local)
-docker compose up -d
-docker logs -f opensearch-init
-python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-
-# Inspect
-python3 dr-switchover.py --operation status
-python3 dr-switchover.py --dry-run --operation failover --non-interactive
-
-# Switch
-python3 dr-switchover.py --operation failover
-python3 dr-switchover.py --operation failback
-
-# Automation
-python3 dr-switchover.py --operation failover --non-interactive
-
-# AWS-style
-python3 dr-switchover.py --config ./config.json --operation status
-```
-
+| Team | Indices / patterns | Static or auto-follow | Notes |
+| ---- | ------------------ | --------------------- | ----- |
+|      |                    |                       |       |
+|      |                    |                       |       |
+|      |                    |                       |       |
