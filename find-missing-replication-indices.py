@@ -18,7 +18,7 @@ Usage:
 
 Uses the same config.json / env-var schema as dr-switchover.py
 (primary_url, secondary_url, primary_alias_on_secondary,
-secondary_alias_on_primary, username, password, verify_ssl).
+secondary_alias_on_primary, credentials_secret_arn, verify_ssl).
 The --direction flag picks which of primary/secondary is SOURCE (leader)
 vs. DESTINATION (follower) for this comparison.
 
@@ -79,7 +79,12 @@ class Config:
     # secondary_alias_on_primary : alias visible from PRIMARY that points to SECONDARY.
     secondary_alias_on_primary: str = "secondary-cluster"
 
-    # Optional basic-auth credentials (not required for local Docker / security-disabled)
+    # Optional AWS Secrets Manager ARN holding {"username": ..., "password": ...}.
+    # Shared by both clusters. Leave empty for local Docker / security-disabled.
+    credentials_secret_arn: str = ""
+
+    # Basic-auth credentials — resolved at runtime from the secret above or from
+    # OPENSEARCH_USERNAME / OPENSEARCH_PASSWORD. Never read from config.json.
     username: str = ""
     password: str = ""
 
@@ -102,16 +107,20 @@ def load_config(config_path: Optional[str], cli_overrides: dict) -> Config:
         with open(config_path) as f:
             data = json.load(f)
         for key, value in data.items():
+            if key in ("username", "password"):
+                warn(f"'{key}' in {config_path} is ignored — use credentials_secret_arn instead.")
+                continue
             if hasattr(cfg, key):
                 setattr(cfg, key, value)
 
     env_map = {
-        "OPENSEARCH_PRIMARY_URL":     "primary_url",
-        "OPENSEARCH_SECONDARY_URL":   "secondary_url",
-        "OPENSEARCH_PRIMARY_ALIAS":   "primary_alias_on_secondary",
-        "OPENSEARCH_SECONDARY_ALIAS": "secondary_alias_on_primary",
-        "OPENSEARCH_USERNAME":        "username",
-        "OPENSEARCH_PASSWORD":        "password",
+        "OPENSEARCH_PRIMARY_URL":            "primary_url",
+        "OPENSEARCH_SECONDARY_URL":          "secondary_url",
+        "OPENSEARCH_PRIMARY_ALIAS":          "primary_alias_on_secondary",
+        "OPENSEARCH_SECONDARY_ALIAS":        "secondary_alias_on_primary",
+        "OPENSEARCH_CREDENTIALS_SECRET_ARN": "credentials_secret_arn",
+        "OPENSEARCH_USERNAME":               "username",
+        "OPENSEARCH_PASSWORD":               "password",
     }
     for env_key, attr in env_map.items():
         if env_key in os.environ:
@@ -121,7 +130,61 @@ def load_config(config_path: Optional[str], cli_overrides: dict) -> Config:
         if value is not None and hasattr(cfg, attr):
             setattr(cfg, attr, value)
 
+    # Explicit env-var credentials win; otherwise resolve them from the secret.
+    if cfg.credentials_secret_arn and not (cfg.username and cfg.password):
+        cfg.username, cfg.password = fetch_secret_credentials(cfg.credentials_secret_arn)
+
     return cfg
+
+
+def fetch_secret_credentials(secret_arn: str) -> tuple[str, str]:
+    """
+    Return (username, password) from a JSON secret in AWS Secrets Manager.
+    Any failure exits the script before a single OpenSearch call is made.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:
+        err("'boto3' is required when credentials_secret_arn is set.  pip install boto3")
+        sys.exit(1)
+
+    # arn:aws:secretsmanager:<region>:<account>:secret:<name>
+    arn_parts = secret_arn.split(":")
+    if len(arn_parts) < 7 or arn_parts[2] != "secretsmanager" or not arn_parts[3]:
+        err(f"Invalid Secrets Manager ARN: {secret_arn}")
+        sys.exit(1)
+    region = arn_parts[3]
+
+    try:
+        client = boto3.client("secretsmanager", region_name=region)
+        resp   = client.get_secret_value(SecretId=secret_arn)
+    except ClientError as exc:
+        # AWS answered with an error: not found, access denied, KMS decrypt failure, ...
+        error = exc.response.get("Error", {})
+        err(f"Failed to read secret {secret_arn}: {error.get('Code')} — {error.get('Message')}")
+        sys.exit(1)
+    except BotoCoreError as exc:
+        # Never reached AWS: no AWS credentials, expired SSO, network/endpoint error, ...
+        err(f"Failed to read secret {secret_arn}: {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        err(f"Unexpected error reading secret {secret_arn}: {type(exc).__name__}: {exc}")
+        sys.exit(1)
+
+    try:
+        data = json.loads(resp["SecretString"])
+        username, password = data["username"], data["password"]
+    except (KeyError, TypeError, ValueError):
+        # Binary secret, non-JSON string, or missing keys. Never echo the value.
+        err(f"Secret {secret_arn} must be a JSON string with 'username' and 'password' keys.")
+        sys.exit(1)
+    if not username or not password:
+        err(f"Secret {secret_arn} has an empty 'username' or 'password'.")
+        sys.exit(1)
+
+    info(f"Loaded OpenSearch credentials from Secrets Manager ({secret_arn})")
+    return username, password
 
 
 # ── OpenSearch API helpers ─────────────────────────────────────────────────
@@ -187,7 +250,8 @@ def build_start_replication_curl(
     }
     payload = json.dumps(body)
 
-    auth_flag = f" -u '{cfg.username}:{cfg.password}'" if cfg.username and cfg.password else ""
+    # Reference credentials via env vars so the secret never lands in stdout / --output-file
+    auth_flag = ' -u "$OPENSEARCH_USERNAME:$OPENSEARCH_PASSWORD"' if cfg.auth() else ""
     insecure_flag = " -k" if not cfg.verify_ssl else ""
 
     return (
@@ -214,6 +278,8 @@ def parse_args() -> argparse.Namespace:
                         help="Connection alias on SECONDARY pointing to PRIMARY")
     parser.add_argument("--secondary-alias", metavar="ALIAS",
                         help="Connection alias on PRIMARY pointing to SECONDARY")
+    parser.add_argument("--secret-arn",    metavar="ARN",
+                        help="AWS Secrets Manager ARN holding OpenSearch username/password")
     parser.add_argument("--direction", choices=["primary-to-secondary", "secondary-to-primary"],
                         default="primary-to-secondary",
                         help="Which cluster is SOURCE (leader) vs. DESTINATION (follower). "
@@ -236,6 +302,7 @@ def main() -> None:
         "secondary_url":              args.secondary_url,
         "primary_alias_on_secondary": args.primary_alias,
         "secondary_alias_on_primary": args.secondary_alias,
+        "credentials_secret_arn":     args.secret_arn,
     }
     cfg = load_config(args.config, cli_overrides)
 
@@ -272,6 +339,9 @@ def main() -> None:
         print(f"    {C.YELLOW}✗  {idx}{C.RESET}")
 
     step("Curl commands to start replication on DESTINATION")
+    if cfg.auth():
+        info("Commands read credentials from $OPENSEARCH_USERNAME / $OPENSEARCH_PASSWORD — "
+             "export them before running.")
     commands = []
     for idx in missing:
         cmd = build_start_replication_curl(destination_url, leader_alias, idx, cfg)

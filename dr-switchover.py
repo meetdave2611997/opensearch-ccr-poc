@@ -97,7 +97,12 @@ class Config:
     #   Used during FAILOVER to start reverse replication (secondary → primary).
     secondary_alias_on_primary: str = "secondary-cluster"
 
-    # Optional basic-auth credentials (not required for local Docker / security-disabled)
+    # Optional AWS Secrets Manager ARN holding {"username": ..., "password": ...}.
+    # Shared by both clusters. Leave empty for local Docker / security-disabled.
+    credentials_secret_arn: str = ""
+
+    # Basic-auth credentials — resolved at runtime from the secret above or from
+    # OPENSEARCH_USERNAME / OPENSEARCH_PASSWORD. Never read from config.json.
     username: str = ""
     password: str = ""
 
@@ -127,19 +132,23 @@ def load_config(config_path: Optional[str], cli_overrides: dict) -> Config:
         with open(config_path, encoding="utf-8") as f:
             data = json.load(f)
         for key, value in data.items():
+            if key in ("username", "password"):
+                warn(f"'{key}' in {config_path} is ignored — use credentials_secret_arn instead.")
+                continue
             if hasattr(cfg, key):
                 setattr(cfg, key, value)
 
     env_map = {
-        "OPENSEARCH_PRIMARY_URL":     "primary_url",
-        "OPENSEARCH_SECONDARY_URL":   "secondary_url",
-        "OPENSEARCH_INDICES_FILE":    "indices_file",
-        "OPENSEARCH_PRIMARY_ALIAS":   "primary_alias_on_secondary",
-        "OPENSEARCH_SECONDARY_ALIAS": "secondary_alias_on_primary",
-        "OPENSEARCH_USERNAME":        "username",
-        "OPENSEARCH_PASSWORD":        "password",
-        "OPENSEARCH_RETRY_MAX":       "retry_max_attempts",
-        "OPENSEARCH_RETRY_DELAY":     "retry_base_delay",
+        "OPENSEARCH_PRIMARY_URL":            "primary_url",
+        "OPENSEARCH_SECONDARY_URL":          "secondary_url",
+        "OPENSEARCH_INDICES_FILE":           "indices_file",
+        "OPENSEARCH_PRIMARY_ALIAS":          "primary_alias_on_secondary",
+        "OPENSEARCH_SECONDARY_ALIAS":        "secondary_alias_on_primary",
+        "OPENSEARCH_CREDENTIALS_SECRET_ARN": "credentials_secret_arn",
+        "OPENSEARCH_USERNAME":               "username",
+        "OPENSEARCH_PASSWORD":               "password",
+        "OPENSEARCH_RETRY_MAX":              "retry_max_attempts",
+        "OPENSEARCH_RETRY_DELAY":            "retry_base_delay",
     }
     for env_key, attr in env_map.items():
         if env_key in os.environ:
@@ -155,7 +164,61 @@ def load_config(config_path: Optional[str], cli_overrides: dict) -> Config:
         if value is not None and hasattr(cfg, attr):
             setattr(cfg, attr, value)
 
+    # Explicit env-var credentials win; otherwise resolve them from the secret.
+    if cfg.credentials_secret_arn and not (cfg.username and cfg.password):
+        cfg.username, cfg.password = fetch_secret_credentials(cfg.credentials_secret_arn)
+
     return cfg
+
+
+def fetch_secret_credentials(secret_arn: str) -> tuple[str, str]:
+    """
+    Return (username, password) from a JSON secret in AWS Secrets Manager.
+    Any failure exits the script before a single OpenSearch call is made.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:
+        err("'boto3' is required when credentials_secret_arn is set.  pip install boto3")
+        sys.exit(1)
+
+    # arn:aws:secretsmanager:<region>:<account>:secret:<name>
+    arn_parts = secret_arn.split(":")
+    if len(arn_parts) < 7 or arn_parts[2] != "secretsmanager" or not arn_parts[3]:
+        err(f"Invalid Secrets Manager ARN: {secret_arn}")
+        sys.exit(1)
+    region = arn_parts[3]
+
+    try:
+        client = boto3.client("secretsmanager", region_name=region)
+        resp   = client.get_secret_value(SecretId=secret_arn)
+    except ClientError as exc:
+        # AWS answered with an error: not found, access denied, KMS decrypt failure, ...
+        error = exc.response.get("Error", {})
+        err(f"Failed to read secret {secret_arn}: {error.get('Code')} — {error.get('Message')}")
+        sys.exit(1)
+    except BotoCoreError as exc:
+        # Never reached AWS: no AWS credentials, expired SSO, network/endpoint error, ...
+        err(f"Failed to read secret {secret_arn}: {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        err(f"Unexpected error reading secret {secret_arn}: {type(exc).__name__}: {exc}")
+        sys.exit(1)
+
+    try:
+        data = json.loads(resp["SecretString"])
+        username, password = data["username"], data["password"]
+    except (KeyError, TypeError, ValueError):
+        # Binary secret, non-JSON string, or missing keys. Never echo the value.
+        err(f"Secret {secret_arn} must be a JSON string with 'username' and 'password' keys.")
+        sys.exit(1)
+    if not username or not password:
+        err(f"Secret {secret_arn} has an empty 'username' or 'password'.")
+        sys.exit(1)
+
+    info(f"Loaded OpenSearch credentials from Secrets Manager ({secret_arn})")
+    return username, password
 
 
 def _load_indices_data(indices_file: str) -> dict:
@@ -1084,6 +1147,10 @@ def parse_args() -> argparse.Namespace:
         help="Connection alias on PRIMARY pointing to SECONDARY (used during failover)",
     )
     parser.add_argument(
+        "--secret-arn", metavar="ARN",
+        help="AWS Secrets Manager ARN holding OpenSearch username/password",
+    )
+    parser.add_argument(
         "--non-interactive", action="store_true",
         help="Auto-confirm all prompts (for CI/automation)",
     )
@@ -1116,6 +1183,7 @@ def main() -> None:
         "indices_file":               args.indices_file,
         "primary_alias_on_secondary": args.primary_alias,
         "secondary_alias_on_primary": args.secondary_alias,
+        "credentials_secret_arn":     args.secret_arn,
         "retry_max_attempts":         args.retry_max,
         "retry_base_delay":           args.retry_delay,
         "dry_run":                    args.dry_run or None,

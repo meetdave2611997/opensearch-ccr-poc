@@ -49,6 +49,8 @@ curl http://localhost:9201/products/_count | jq
 | `indices.json` | List of indices to replicate, with optional per-index auto-follow config |
 | `init/setup.sh` | Auto-runs on startup: creates indices, seeds data, sets up CCR |
 | `dr-switchover.py` | Interactive DR testing & failback script (Python, AWS-compatible) |
+| `find-missing-replication-indices.py` | Lists indices on the leader missing from the follower and prints curl commands to start replication |
+| `config.json` | Shared config for both scripts (URLs, aliases, `credentials_secret_arn`, `verify_ssl`) |
 
 ## DR Switchover Script
 
@@ -57,7 +59,7 @@ Written in Python. Compatible with **AWS OpenSearch** (cross-cluster connections
 ### Prerequisites
 
 ```bash
-pip install requests
+pip install -r requirements.txt   # requests, plus boto3 (only needed when credentials_secret_arn is set)
 ```
 
 ### Run
@@ -77,7 +79,8 @@ python3 dr-switchover.py \
   --secondary-url  http://secondary.example.com:9200 \
   --indices-file   /path/to/indices.json \
   --primary-alias  primary-cluster    \
-  --secondary-alias secondary-cluster
+  --secondary-alias secondary-cluster \
+  --secret-arn     arn:aws:secretsmanager:us-east-1:123456789012:secret:opensearch-creds-AbCdEf
 ```
 
 Environment variable equivalents:
@@ -88,9 +91,28 @@ export OPENSEARCH_SECONDARY_URL=http://secondary.example.com:9200
 export OPENSEARCH_INDICES_FILE=./indices.json
 export OPENSEARCH_PRIMARY_ALIAS=primary-cluster      # alias on SECONDARY → PRIMARY
 export OPENSEARCH_SECONDARY_ALIAS=secondary-cluster  # alias on PRIMARY   → SECONDARY
+export OPENSEARCH_CREDENTIALS_SECRET_ARN=arn:aws:secretsmanager:...
 ```
 
 Or use a `config.json` (see below).
+
+### Credentials — AWS Secrets Manager
+
+Both scripts read the OpenSearch username/password from a Secrets Manager secret instead of from `config.json`. Set `credentials_secret_arn` in `config.json` (or `--secret-arn` / `OPENSEARCH_CREDENTIALS_SECRET_ARN`). The same credentials are used for both clusters.
+
+The secret must be a JSON string:
+
+```json
+{ "username": "admin", "password": "..." }
+```
+
+- AWS credentials come from the standard boto3 chain (`AWS_PROFILE`, SSO, instance role, …); the region is taken from the ARN.
+- The caller needs `secretsmanager:GetSecretValue` on the secret (plus `kms:Decrypt` if it is encrypted with a customer-managed key).
+- If the secret cannot be read (boto3 missing, bad ARN, no AWS credentials, access denied, secret not found, malformed or empty value) the script prints an `[ERR ]` line and exits with code 1 **before** any OpenSearch call — including in `--dry-run`.
+- `OPENSEARCH_USERNAME` / `OPENSEARCH_PASSWORD`, when both set, override the secret (handy for ad-hoc runs).
+- `username` / `password` keys in `config.json` are ignored with a warning.
+- Leave the ARN empty for the local Docker setup (security disabled, no auth, boto3 not required).
+- `find-missing-replication-indices.py` writes curl commands that reference `$OPENSEARCH_USERNAME` / `$OPENSEARCH_PASSWORD` rather than the resolved password; export those before running them.
 
 ### AWS Prerequisites — Connection Aliases
 

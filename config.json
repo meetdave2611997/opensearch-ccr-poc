@@ -5,7 +5,6 @@
   "primary_alias_on_secondary": "primary-cluster",
   "secondary_alias_on_primary": "secondary-cluster",
 
-  "username": "",
-  "password": "",
+  "credentials_secret_arn": "",
   "verify_ssl": true
 }
