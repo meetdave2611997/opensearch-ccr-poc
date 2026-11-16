@@ -1,0 +1,97 @@
+// CloudBees CI pipeline: OpenSearch CCR DR switchover POC.
+//
+// Starts a throwaway PRIMARY + SECONDARY OpenSearch pair on the agent's Docker,
+// sets up PRIMARY → SECONDARY replication, then runs dr-switchover.py failover and
+// failback with state checks after each step. All logic lives in ci/pipeline.sh;
+// this file only maps stages to its subcommands.
+//
+// Agent requirements: Docker + docker compose v2.1+ (see docs/cloudbees-ccr-pipeline.md).
+
+def approvers = "amit@spekit.co, arajwani, ankit@spekit.co, akalsariya, dipal@spekit.co, dparmar, hemant@spekit.co, hrao, nirav@spekit.co, nkatarmal, jay.kothari@spekit.co, jkothari"
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(name: 'OPERATION', choices: ['full-cycle', 'failover-only', 'status-only'],
+               description: 'full-cycle = failover + failback with checks; failover-only stops in the DR state; status-only just bootstraps and reports')
+        booleanParam(name: 'DRY_RUN', defaultValue: false,
+                     description: 'Pass --dry-run to failover/failback (no mutating calls; DR checks are skipped)')
+        string(name: 'OPENSEARCH_VERSION', defaultValue: '2.13.0', description: 'opensearchproject/opensearch image tag')
+        booleanParam(name: 'PAUSE_FOR_DR_TEST', defaultValue: false,
+                     description: 'Wait for manual approval between failover and failback')
+    }
+
+    environment {
+        OPENSEARCH_VERSION = "${params.OPENSEARCH_VERSION}"
+        DRY_RUN            = "${params.DRY_RUN}"
+        REPORTS_DIR        = "${WORKSPACE}/reports"
+    }
+
+    stages {
+        stage('Preflight') {
+            steps {
+                sh 'rm -rf reports && chmod +x ci/pipeline.sh && ci/pipeline.sh preflight'
+            }
+        }
+        stage('Build runner image') {
+            steps { sh 'ci/pipeline.sh build' }
+        }
+        stage('Start clusters') {
+            steps { sh 'ci/pipeline.sh up' }
+        }
+        stage('Bootstrap replication') {
+            steps { sh 'ci/pipeline.sh bootstrap' }
+        }
+        stage('Assert normal state') {
+            steps { sh 'ci/pipeline.sh assert-normal' }
+        }
+        stage('Failover (dry run)') {
+            when { expression { params.OPERATION != 'status-only' } }
+            steps { sh 'ci/pipeline.sh dry-run-failover' }
+        }
+        stage('Failover') {
+            when { expression { params.OPERATION != 'status-only' } }
+            steps { sh 'ci/pipeline.sh failover' }
+        }
+        stage('Assert DR state') {
+            when { expression { params.OPERATION != 'status-only' && !params.DRY_RUN } }
+            steps { sh 'ci/pipeline.sh assert-dr' }
+        }
+        stage('DR test window') {
+            when { expression { params.OPERATION == 'full-cycle' && params.PAUSE_FOR_DR_TEST } }
+            steps {
+                input message: 'SECONDARY is active. Run failback?', submitter: approvers
+            }
+        }
+        stage('Failback') {
+            when { expression { params.OPERATION == 'full-cycle' } }
+            steps { sh 'ci/pipeline.sh failback' }
+        }
+        stage('Assert restored state') {
+            when { expression { params.OPERATION == 'full-cycle' && !params.DRY_RUN } }
+            steps { sh 'ci/pipeline.sh assert-restored' }
+        }
+        stage('Status report') {
+            steps {
+                sh 'ci/pipeline.sh status'
+                sh 'ci/pipeline.sh find-missing'
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'ci/pipeline.sh logs || true'
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+            sh 'ci/pipeline.sh down || true'
+        }
+    }
+}

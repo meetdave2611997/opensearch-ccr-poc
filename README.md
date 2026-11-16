@@ -51,6 +51,7 @@ curl http://localhost:9201/products/_count | jq
 | `dr-switchover.py` | Interactive DR testing & failback script (Python, AWS-compatible) |
 | `find-missing-replication-indices.py` | Lists indices on the leader missing from the follower and prints curl commands to start replication |
 | `config.json` | Shared config for both scripts (URLs, aliases, `credentials_secret_arn`, `verify_ssl`) |
+| `ci/` | CloudBees CI pipeline (`ci/Jenkinsfile`) and its local driver `ci/pipeline.sh` — see [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md) |
 
 ## DR Switchover Script
 
@@ -155,6 +156,19 @@ FAILBACK  (return to normal)
 
 The script asks for confirmation before each step. Use `--non-interactive` to skip prompts (for automation/CI).
 
+Safety guards apply in every mode:
+- The cluster being promoted must be healthy before anything changes.
+- `--non-interactive` aborts instead of auto-confirming "Proceed anyway?" after a failed step.
+- An index is only deleted from the cluster being demoted if it also exists on the new leader.
+
+See [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md#11-safety-guards).
+
+`--operation failover` / `failback` exit with code `1` if the operation was aborted or any replication stop/start or auto-follow rule call failed, so CI jobs fail on a partial switchover.
+
+### CI / CloudBees
+
+The whole failover → failback cycle runs in CloudBees CI against throwaway Docker clusters via `ci/Jenkinsfile`. Run the same thing locally with `ci/pipeline.sh all`. Architecture, prerequisites and roadmap: [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md).
+
 ---
 
 ## Auto-Follow
@@ -166,15 +180,15 @@ Auto-follow lets the follower cluster automatically replicate new indices whose 
 ```json
 {
   "indices": [
-    { "name": "products", "description": "Product catalog",       "shards": 1, "replicas": 0, "autofollow": true  },
+    { "name": "products", "description": "Product catalog",       "shards": 1, "replicas": 0, "autofollow": true, "autofollow_pattern": "products*" },
     { "name": "orders",   "description": "Customer orders",       "shards": 1, "replicas": 0, "autofollow": false },
     { "name": "users",    "description": "User profiles",         "shards": 1, "replicas": 0, "autofollow": false },
-    { "name": "events",   "description": "Application event logs","shards": 1, "replicas": 0, "autofollow": true  }
+    { "description": "Metrics indices",                           "shards": 1, "replicas": 0, "autofollow": true, "autofollow_pattern": "metrics-idx*" }
   ]
 }
 ```
 
-- `autofollow: true` — the script creates an auto-follow rule on the follower cluster using the index `name` as the rule name and pattern. OpenSearch will automatically replicate any new index on the leader whose name matches the pattern.
+- `autofollow: true` — the script creates an auto-follow rule on the follower cluster. `autofollow_pattern` is **required** (the script exits with an error without it); OpenSearch replicates every leader index whose name matches the pattern. The rule name is `name`, or the pattern with wildcards stripped when `name` is absent. These indices are managed only by the rule — they are not `_start`ed individually.
 - `autofollow: false` (or field absent) — index is replicated only via explicit `_start`, no auto-follow rule is created.
 - **Auto-follow is fully automatic** — no separate CLI command is needed. The rules are created/deleted as part of normal failover and failback.
 

@@ -1,0 +1,13 @@
+{
+  "primary_url": "http://opensearch-primary:9200",
+  "secondary_url": "http://opensearch-secondary:9200",
+  "indices_file": "./indices.json",
+  "primary_alias_on_secondary": "primary-cluster",
+  "secondary_alias_on_primary": "secondary-cluster",
+
+  "credentials_secret_arn": "",
+  "verify_ssl": false,
+
+  "retry_max_attempts": 5,
+  "retry_base_delay": 2.0
+}

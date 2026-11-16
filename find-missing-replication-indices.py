@@ -204,12 +204,18 @@ def _request(method: str, url: str, cfg: Config, body: Optional[dict] = None):
 def list_indices(base_url: str, cfg: Config) -> list[str]:
     """
     Return all non-system index names on the cluster using
-    GET /_cat/indices?format=json&h=index
+    GET /_settings?filter_path=*.settings.index.uuid  (keys = index names)
+
+    _cat/indices is deliberately not used: after a CCR failover/failback cycle,
+    OpenSearch 2.x can report a negative store size for re-followed indices and
+    _cat/indices then fails for every request with HTTP 400
+    ("Values less than -1 bytes are not supported"). _settings does not touch
+    store stats. Same approach as discover_wildcard_indices() in dr-switchover.py.
 
     System indices (leading '.') are excluded here.
     """
-    url = f"{base_url}/_cat/indices"
-    params = {"format": "json", "h": "index"}
+    url = f"{base_url}/_settings"
+    params = {"filter_path": "*.settings.index.uuid"}
     try:
         r = requests.request(
             "GET", url,
@@ -219,8 +225,7 @@ def list_indices(base_url: str, cfg: Config) -> list[str]:
             timeout=30,
         )
         r.raise_for_status()
-        entries = r.json()
-        names = [e["index"] for e in entries if not e["index"].startswith(".")]
+        names = [name for name in r.json().keys() if not name.startswith(".")]
         return sorted(names)
     except Exception as exc:
         err(f"Failed to list indices on {base_url}: {exc}")
@@ -306,12 +311,14 @@ def main() -> None:
     }
     cfg = load_config(args.config, cli_overrides)
 
+    # leader_alias is the connection alias that lives on the DESTINATION (follower)
+    # and points to the SOURCE (leader) — the _start call runs on the destination.
     if args.direction == "primary-to-secondary":
         source_url, destination_url = cfg.primary_url, cfg.secondary_url
-        leader_alias = cfg.secondary_alias_on_primary
+        leader_alias = cfg.primary_alias_on_secondary
     else:
         source_url, destination_url = cfg.secondary_url, cfg.primary_url
-        leader_alias = cfg.primary_alias_on_secondary
+        leader_alias = cfg.secondary_alias_on_primary
 
     header("CCR — Missing Replication Indices Finder")
     info(f"Direction           : {args.direction}")
