@@ -14,6 +14,7 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
 COPY dr-switchover.py find-missing-replication-indices.py indices.json ./
+COPY teams/ ./teams/
 COPY ci/config.ci.json ci/ccr_lib.py ci/bootstrap.py ci/assert_state.py ./ci/
 
 RUN useradd --create-home --uid 10001 runner

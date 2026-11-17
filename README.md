@@ -154,11 +154,11 @@ FAILBACK  (return to normal)
               (normal state restored)
 ```
 
-The script asks for confirmation before each step. Use `--non-interactive` to skip prompts (for automation/CI).
+The script asks for confirmation before each step, and a person must answer every prompt; there is no auto-confirm mode. Locally you answer at the terminal. In CI, `--approval-dir DIR` publishes each prompt as a file, and the CloudBees pipeline shows it to an approver (see below). `--approval-timeout SECS` (default 3600) treats an unanswered prompt as "no".
 
 Safety guards apply in every mode:
 - The cluster being promoted must be healthy before anything changes.
-- `--non-interactive` aborts instead of auto-confirming "Proceed anyway?" after a failed step.
+- "Proceed anyway?" after a failed step always needs a person's answer.
 - An index is only deleted from the cluster being demoted if it also exists on the new leader.
 
 See [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md#11-safety-guards).
@@ -167,7 +167,7 @@ See [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md#11-safety-gu
 
 ### CI / CloudBees
 
-The whole failover → failback cycle runs in CloudBees CI against throwaway Docker clusters via `ci/Jenkinsfile`. Run the same thing locally with `ci/pipeline.sh all`. Architecture, prerequisites and roadmap: [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md).
+`ci/Jenkinsfile` runs one operation (`status`, `failover` or `failback`) for one team (`rit`, `researchdesk`, `eim`; see `teams/`). Every script prompt becomes a CloudBees approval, and typing `DELETE` is required before indices are deleted. Run the same steps locally with `TEAM=rit ci/pipeline.sh run failover`, answering at the terminal. Architecture, prerequisites and roadmap: [docs/cloudbees-ccr-pipeline.md](docs/cloudbees-ccr-pipeline.md).
 
 ---
 
@@ -229,10 +229,10 @@ Preview exactly what the script *would* do without touching either cluster. All 
 
 ```bash
 # See what a failover would do
-python3 dr-switchover.py --dry-run --operation failover --non-interactive
+python3 dr-switchover.py --dry-run --operation failover
 
 # Preview a failback
-python3 dr-switchover.py --dry-run --operation failback --non-interactive
+python3 dr-switchover.py --dry-run --operation failback
 ```
 
 Each suppressed call is printed as:

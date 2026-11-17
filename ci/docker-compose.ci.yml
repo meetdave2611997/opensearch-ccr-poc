@@ -1,14 +1,14 @@
 # CI-only cluster pair for the CCR DR pipeline.
 #
 # Differs from ../docker-compose.yml (local dev) on purpose:
-#   - no container_name and no published host ports, so several builds can run on
-#     one agent at once (each build uses its own compose project: -p ccr-<build>)
+#   - no container_name and no published host ports, so each team gets its own
+#     isolated pair on one agent (compose project: -p ccr-<team>)
 #   - no Dashboards
 #   - a "runner" service (profile: tools) on the same network that runs the scripts
 #
 # Usage (see ci/pipeline.sh):
-#   docker compose -p ccr-local -f ci/docker-compose.ci.yml up -d --wait opensearch-primary opensearch-secondary
-#   docker compose -p ccr-local -f ci/docker-compose.ci.yml run --rm runner dr-switchover.py ...
+#   docker compose -p ccr-rit -f ci/docker-compose.ci.yml up -d --wait opensearch-primary opensearch-secondary
+#   docker compose -p ccr-rit -f ci/docker-compose.ci.yml run --rm runner dr-switchover.py ...
 
 x-opensearch: &opensearch
   image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-2.13.0}
@@ -61,6 +61,7 @@ services:
     networks:
       - opensearch-net
     environment:
+      - OPENSEARCH_INDICES_FILE
       - OPENSEARCH_RETRY_MAX
       - OPENSEARCH_RETRY_DELAY
 

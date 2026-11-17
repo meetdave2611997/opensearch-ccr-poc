@@ -1,97 +1,137 @@
-// CloudBees CI pipeline: OpenSearch CCR DR switchover POC.
+// CloudBees CI pipeline: OpenSearch CCR DR switchover (Docker POC).
 //
-// Starts a throwaway PRIMARY + SECONDARY OpenSearch pair on the agent's Docker,
-// sets up PRIMARY → SECONDARY replication, then runs dr-switchover.py failover and
-// failback with state checks after each step. All logic lives in ci/pipeline.sh;
-// this file only maps stages to its subcommands.
+// Runs ONE operation (failover, failback or status) for ONE team's cluster pair.
+// failover / failback go through approvals:
+//   1. a dry-run plan is shown and must be approved before anything changes;
+//   2. the script then runs interactively — every prompt it asks ("Stop replication…?",
+//      "Type DELETE…", "Proceed anyway?") becomes a CloudBees input step that an
+//      approver answers. Nothing is auto-confirmed.
 //
-// Agent requirements: Docker + docker compose v2.1+ (see docs/cloudbees-ccr-pipeline.md).
+// All shell logic lives in ci/pipeline.sh. Agent needs Docker + docker compose v2.1+
+// (see docs/cloudbees-ccr-pipeline.md).
 
 def approvers = "amit@spekit.co, arajwani, ankit@spekit.co, akalsariya, dipal@spekit.co, dparmar, hemant@spekit.co, hrao, nirav@spekit.co, nkatarmal, jay.kothari@spekit.co, jkothari"
+
+// Find-missing direction once the operation has finished.
+def directionAfter = [failover: 'secondary-to-primary', failback: 'primary-to-secondary', status: 'primary-to-secondary']
+// State the team's clusters must be in before the operation may start.
+def requiredState = [failover: 'normal', failback: 'dr']
 
 pipeline {
     agent any
 
     options {
         timestamps()
-        timeout(time: 45, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
-        disableConcurrentBuilds()
+        timeout(time: 4, unit: 'HOURS')          // approvals can take a while
+        buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '50'))
+        disableConcurrentBuilds()                 // one DR operation at a time
     }
 
     parameters {
-        choice(name: 'OPERATION', choices: ['full-cycle', 'failover-only', 'status-only'],
-               description: 'full-cycle = failover + failback with checks; failover-only stops in the DR state; status-only just bootstraps and reports')
-        booleanParam(name: 'DRY_RUN', defaultValue: false,
-                     description: 'Pass --dry-run to failover/failback (no mutating calls; DR checks are skipped)')
-        string(name: 'OPENSEARCH_VERSION', defaultValue: '2.13.0', description: 'opensearchproject/opensearch image tag')
-        booleanParam(name: 'PAUSE_FOR_DR_TEST', defaultValue: false,
-                     description: 'Wait for manual approval between failover and failback')
+        choice(name: 'OPERATION', choices: ['status', 'failover', 'failback'],
+               description: 'status = read-only report; failover = promote SECONDARY; failback = restore PRIMARY')
+        choice(name: 'TEAM', choices: ['rit', 'researchdesk', 'eim'],
+               description: 'Team whose clusters / indices (teams/<team>/indices.json) to operate on')
     }
 
     environment {
-        OPENSEARCH_VERSION = "${params.OPENSEARCH_VERSION}"
-        DRY_RUN            = "${params.DRY_RUN}"
-        REPORTS_DIR        = "${WORKSPACE}/reports"
+        TEAM        = "${params.TEAM}"
+        REPORTS_DIR = "${WORKSPACE}/reports"
     }
 
     stages {
         stage('Preflight') {
             steps {
+                script { currentBuild.displayName = "#${env.BUILD_NUMBER} ${params.OPERATION} · ${params.TEAM}" }
                 sh 'rm -rf reports && chmod +x ci/pipeline.sh && ci/pipeline.sh preflight'
             }
         }
         stage('Build runner image') {
             steps { sh 'ci/pipeline.sh build' }
         }
-        stage('Start clusters') {
-            steps { sh 'ci/pipeline.sh up' }
+        stage('Team clusters') {
+            steps { sh 'ci/pipeline.sh ensure' }
         }
-        stage('Bootstrap replication') {
-            steps { sh 'ci/pipeline.sh bootstrap' }
+        stage('Check current state') {
+            when { expression { params.OPERATION != 'status' } }
+            steps { sh "ci/pipeline.sh check-state ${requiredState[params.OPERATION]}" }
         }
-        stage('Assert normal state') {
-            steps { sh 'ci/pipeline.sh assert-normal' }
+        stage('Plan (dry run)') {
+            when { expression { params.OPERATION != 'status' } }
+            steps { sh "ci/pipeline.sh plan ${params.OPERATION}" }
         }
-        stage('Failover (dry run)') {
-            when { expression { params.OPERATION != 'status-only' } }
-            steps { sh 'ci/pipeline.sh dry-run-failover' }
-        }
-        stage('Failover') {
-            when { expression { params.OPERATION != 'status-only' } }
-            steps { sh 'ci/pipeline.sh failover' }
-        }
-        stage('Assert DR state') {
-            when { expression { params.OPERATION != 'status-only' && !params.DRY_RUN } }
-            steps { sh 'ci/pipeline.sh assert-dr' }
-        }
-        stage('DR test window') {
-            when { expression { params.OPERATION == 'full-cycle' && params.PAUSE_FOR_DR_TEST } }
+        stage('Approve plan') {
+            when { expression { params.OPERATION != 'status' } }
             steps {
-                input message: 'SECONDARY is active. Run failback?', submitter: approvers
+                input message: "Start ${params.OPERATION.toUpperCase()} for team '${params.TEAM}'? Review the 'Plan (dry run)' log first. You will be asked again before each step.",
+                      ok: "Start ${params.OPERATION}", submitter: approvers
             }
         }
-        stage('Failback') {
-            when { expression { params.OPERATION == 'full-cycle' } }
-            steps { sh 'ci/pipeline.sh failback' }
+        stage('Run with approvals') {
+            when { expression { params.OPERATION != 'status' } }
+            steps {
+                sh "ci/pipeline.sh op-start ${params.OPERATION}"
+                script {
+                    // Relay every prompt the script asks to an approver until it exits.
+                    while (true) {
+                        sh 'ci/pipeline.sh op-logs'
+                        def prompt = sh(script: 'ci/pipeline.sh op-prompt', returnStdout: true).trim()
+                        if (prompt) {
+                            // Format from op-prompt: id, kind, question, then one detail per line.
+                            def lines    = prompt.split('\n')
+                            def id       = lines[0].trim()
+                            def kind     = lines[1].trim()
+                            def question = lines[2].trim()
+                            def details  = ''
+                            for (int i = 3; i < lines.length; i++) { details += lines[i] + '\n' }
+                            if (!(id ==~ /\d+/)) { error("Unexpected prompt id '${id}'") }
+
+                            def answer = 'no'
+                            try {
+                                if (kind == 'delete') {
+                                    def typed = input(
+                                        message: "[#${id}] ${question}\n\nIndices:\n${details}",
+                                        ok: 'Submit', submitter: approvers,
+                                        parameters: [string(name: 'CONFIRM', defaultValue: '',
+                                                            description: 'Type DELETE (uppercase) to permanently delete the indices listed above. Anything else aborts.')])
+                                    answer = (typed?.trim() == 'DELETE') ? 'DELETE' : 'no'
+                                } else {
+                                    input message: "[#${id}] ${question}", ok: 'Yes, proceed', submitter: approvers
+                                    answer = 'yes'
+                                }
+                            } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                                answer = 'no'         // "Abort" clicked: the script stops cleanly
+                            }
+                            echo "Approval #${id}: ${answer}"
+                            sh "ci/pipeline.sh op-answer ${id} ${answer}"
+                        } else if (sh(script: 'ci/pipeline.sh op-running', returnStatus: true) != 0) {
+                            break
+                        } else {
+                            sleep(time: 3, unit: 'SECONDS')
+                        }
+                    }
+                }
+                sh 'ci/pipeline.sh op-finish'
+            }
         }
-        stage('Assert restored state') {
-            when { expression { params.OPERATION == 'full-cycle' && !params.DRY_RUN } }
-            steps { sh 'ci/pipeline.sh assert-restored' }
+        stage('Verify') {
+            when { expression { params.OPERATION != 'status' } }
+            steps { sh "ci/pipeline.sh verify ${params.OPERATION}" }
         }
         stage('Status report') {
             steps {
                 sh 'ci/pipeline.sh status'
-                sh 'ci/pipeline.sh find-missing'
+                sh "ci/pipeline.sh find-missing ${directionAfter[params.OPERATION]}"
             }
         }
     }
 
     post {
         always {
+            sh 'ci/pipeline.sh op-cleanup || true'
             sh 'ci/pipeline.sh logs || true'
             archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
-            sh 'ci/pipeline.sh down || true'
+            // The team's clusters are kept on purpose: failover and failback run in separate builds.
         }
     }
 }

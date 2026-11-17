@@ -9,9 +9,13 @@ both clusters before running.
 
 Usage:
   python3 dr-switchover.py                        # interactive menu
-  python3 dr-switchover.py --operation failover   # run failover non-interactively
-  python3 dr-switchover.py --operation failback   # run failback non-interactively
+  python3 dr-switchover.py --operation failover   # run failover (asks before each step)
+  python3 dr-switchover.py --operation failback   # run failback (asks before each step)
   python3 dr-switchover.py --operation status     # show current replication state
+
+  Every confirmation is answered by a person: at the terminal, or — with
+  --approval-dir, used by the CloudBees pipeline — through approval files that the
+  pipeline turns into CloudBees "input" approvals. There is no auto-confirm mode.
 
   python3 dr-switchover.py --config path/to/config.json
   python3 dr-switchover.py --dry-run --operation failover
@@ -613,17 +617,87 @@ def _retry_with_backoff(fn, max_attempts: int = 3, base_delay: float = 2.0) -> b
 
 
 # ── Confirmation prompts ───────────────────────────────────────────────────
+#
+# Prompts are answered at the terminal, or — when --approval-dir is set — through
+# files, so a CI system can show each prompt to an approver:
+#
+#   script writes  <dir>/prompt.json   {"id": "001", "kind": "yesno"|"delete",
+#                                       "question": "...", "details": [...]}
+#   approver side  <dir>/answer-001    "yes" / "no"  (yesno)   or  "DELETE" / "no"  (delete)
+#
+# The script waits up to --approval-timeout seconds per prompt; no answer means "no".
+
+_APPROVAL_DIR: Optional[Path] = None
+_APPROVAL_TIMEOUT: float = 3600.0
+_prompt_seq = 0
+
+
+def configure_approvals(approval_dir: Optional[str], timeout: Optional[float]) -> None:
+    global _APPROVAL_DIR, _APPROVAL_TIMEOUT
+    if approval_dir:
+        _APPROVAL_DIR = Path(approval_dir)
+        _APPROVAL_DIR.mkdir(parents=True, exist_ok=True)
+        # Drop leftovers from an earlier run so an old answer can never be reused.
+        for leftover in list(_APPROVAL_DIR.glob("answer-*")) + list(_APPROVAL_DIR.glob("prompt.json")):
+            leftover.unlink(missing_ok=True)
+    if timeout is not None:
+        _APPROVAL_TIMEOUT = timeout
+
+
+def _ask_approver(kind: str, question: str, details: Optional[list[str]] = None) -> str:
+    """Publish a prompt to the approval directory and block until it is answered."""
+    global _prompt_seq
+    assert _APPROVAL_DIR is not None
+    _prompt_seq += 1
+    pid = f"{_prompt_seq:03d}"
+    payload = {"id": pid, "kind": kind, "question": question, "details": details or []}
+    tmp = _APPROVAL_DIR / f".prompt-{pid}.tmp"
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(_APPROVAL_DIR / "prompt.json")          # atomic publish
+    print(f"\n{C.YELLOW}?  [approval #{pid}] {question}{C.RESET}", flush=True)
+    info(f"Waiting for an approver (up to {_APPROVAL_TIMEOUT:.0f}s)...")
+
+    answer_file = _APPROVAL_DIR / f"answer-{pid}"
+    deadline = time.monotonic() + _APPROVAL_TIMEOUT
+    answer = ""
+    while time.monotonic() < deadline:
+        if answer_file.exists():
+            answer = answer_file.read_text(encoding="utf-8").strip()
+            break
+        time.sleep(1)
+    else:
+        err(f"[approval #{pid}] no answer within {_APPROVAL_TIMEOUT:.0f}s — treating as 'no'.")
+    (_APPROVAL_DIR / "prompt.json").unlink(missing_ok=True)
+    info(f"[approval #{pid}] answer: {answer or '(none)'}")
+    return answer
+
+
+def _read_terminal(prompt_text: str) -> Optional[str]:
+    """input() that returns None instead of crashing when no terminal is attached."""
+    print(prompt_text, end="", flush=True)
+    try:
+        return input().strip()
+    except EOFError:
+        print()
+        err("No answer available (stdin closed). Run in a terminal, or use --approval-dir.")
+        return None
+
 
 def confirm(prompt: str, non_interactive: bool = False, dry_run: bool = False) -> bool:
+    """
+    Ask a yes/no question. non_interactive is for library callers only (ci/bootstrap.py);
+    the CLI has no auto-confirm mode.
+    """
     if dry_run:
         dry(f"(dry-run) skipping confirmation: {prompt}")
         return True
     if non_interactive:
         info(f"(non-interactive) auto-confirming: {prompt}")
         return True
-    print(f"\n{C.YELLOW}?  {prompt}{C.RESET}  [y/N] ", end="", flush=True)
-    answer = input().strip().lower()
-    return answer in ("y", "yes")
+    if _APPROVAL_DIR is not None:
+        return _ask_approver("yesno", prompt) == "yes"
+    answer = _read_terminal(f"\n{C.YELLOW}?  {prompt}{C.RESET}  [y/N] ")
+    return (answer or "").lower() in ("y", "yes")
 
 
 def confirm_destructive(
@@ -656,9 +730,17 @@ def confirm_destructive(
         info("(non-interactive) auto-confirming destructive delete.")
         return True
 
-    print(f"\n{C.BOLD}Type  DELETE  (uppercase) to confirm, or anything else to abort: {C.RESET}",
-          end="", flush=True)
-    answer = input().strip()
+    if _APPROVAL_DIR is not None:
+        answer = _ask_approver(
+            "delete",
+            f"PERMANENTLY DELETE {len(indices)} index(es) on {cluster_url} "
+            "so they can be re-created by replication?",
+            details=indices,
+        )
+    else:
+        answer = _read_terminal(
+            f"\n{C.BOLD}Type  DELETE  (uppercase) to confirm, or anything else to abort: {C.RESET}"
+        )
     if answer == "DELETE":
         return True
     warn("Aborted — indices were NOT deleted.")
@@ -1260,8 +1342,13 @@ def parse_args() -> argparse.Namespace:
         help="AWS Secrets Manager ARN holding OpenSearch username/password",
     )
     parser.add_argument(
-        "--non-interactive", action="store_true",
-        help="Auto-confirm all prompts (for CI/automation)",
+        "--approval-dir", metavar="DIR",
+        help="Answer prompts through files in DIR instead of the terminal "
+             "(used by the CloudBees pipeline to turn each prompt into an approval)",
+    )
+    parser.add_argument(
+        "--approval-timeout", metavar="SECS", type=float,
+        help="Seconds to wait for each approval before treating it as 'no' (default: 3600)",
     )
     parser.add_argument("--no-colour", action="store_true", help="Disable ANSI colours")
     parser.add_argument(
@@ -1302,6 +1389,8 @@ def main() -> None:
     if args.dry_run:
         cfg.dry_run = True
 
+    configure_approvals(args.approval_dir, args.approval_timeout)
+
     indices          = load_indices(cfg.indices_file)
     autofollow_rules = load_autofollow_rules(cfg.indices_file)
 
@@ -1310,11 +1399,9 @@ def main() -> None:
         sys.exit(1)
 
     if args.operation == "failover":
-        sys.exit(0 if do_failover(cfg, indices, autofollow_rules,
-                                  non_interactive=args.non_interactive) else 1)
+        sys.exit(0 if do_failover(cfg, indices, autofollow_rules) else 1)
     elif args.operation == "failback":
-        sys.exit(0 if do_failback(cfg, indices, autofollow_rules,
-                                  non_interactive=args.non_interactive) else 1)
+        sys.exit(0 if do_failback(cfg, indices, autofollow_rules) else 1)
     elif args.operation == "status":
         do_status(cfg, indices, autofollow_rules)
     else:
