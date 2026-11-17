@@ -5,7 +5,8 @@
       "description": "Product catalog",
       "shards": 1,
       "replicas": 0,
-      "autofollow": true
+      "autofollow": true,
+      "autofollow_pattern": "products*"
     },
     {
       "name": "orders",
@@ -26,14 +27,16 @@
       "description": "Application event logs",
       "shards": 1,
       "replicas": 0,
-      "autofollow": true
+      "autofollow": true,
+      "autofollow_pattern": "events*"
     },
     {
       "name": "inventory",
       "description": "Product inventory / stock levels",
       "shards": 1,
       "replicas": 0,
-      "autofollow": true
+      "autofollow": true,
+      "autofollow_pattern": "inventory*"
     },
     {
       "name": "reviews",

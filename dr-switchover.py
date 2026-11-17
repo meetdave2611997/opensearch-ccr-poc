@@ -9,9 +9,13 @@ both clusters before running.
 
 Usage:
   python3 dr-switchover.py                        # interactive menu
-  python3 dr-switchover.py --operation failover   # run failover non-interactively
-  python3 dr-switchover.py --operation failback   # run failback non-interactively
+  python3 dr-switchover.py --operation failover   # run failover (asks before each step)
+  python3 dr-switchover.py --operation failback   # run failback (asks before each step)
   python3 dr-switchover.py --operation status     # show current replication state
+
+  Every confirmation is answered by a person: at the terminal, or — with
+  --approval-dir, used by the CloudBees pipeline — through approval files that the
+  pipeline turns into CloudBees "input" approvals. There is no auto-confirm mode.
 
   python3 dr-switchover.py --config path/to/config.json
   python3 dr-switchover.py --dry-run --operation failover
@@ -438,6 +442,50 @@ def index_blocks(base_url: str, index: str, cfg: Config) -> dict:
         return {}
 
 
+def index_exists(base_url: str, index: str, cfg: Config) -> Optional[bool]:
+    """HEAD /<index> → True / False, or None when the cluster could not answer."""
+    try:
+        r = _request("HEAD", f"{base_url}/{index}", cfg)
+    except Exception:
+        return None
+    if r.status_code == 200:
+        return True
+    if r.status_code == 404:
+        return False
+    return None
+
+
+# ── Safety guards ──────────────────────────────────────────────────────────
+
+def require_healthy_new_leader(label: str, base_url: str, cfg: Config) -> bool:
+    """
+    The cluster being promoted must be reachable and green/yellow before anything
+    is changed. If it is not, stopping replication / removing blocks on it fails,
+    and continuing would delete the indices on the other cluster — which may then
+    hold the only good copy of the data.
+    """
+    health = cluster_health(base_url, cfg)
+    if health in ("green", "yellow"):
+        ok(f"{label} ({base_url}) is {health} — safe to promote.")
+        return True
+    err(f"{label} ({base_url}) is '{health}'. It is the cluster being promoted to leader, "
+        "so the operation is aborted before any change is made.")
+    return False
+
+
+def confirm_continue_after_error(non_interactive: bool, dry_run: bool) -> bool:
+    """
+    'Proceed anyway?' after a failed step. Non-interactive runs never continue past
+    a failure: the next steps delete indices, and nobody is there to judge whether
+    that is safe. Interactive runs still get the prompt.
+    """
+    if non_interactive and not dry_run:
+        err("Non-interactive mode never continues past a failed step — "
+            "aborting before any index is deleted.")
+        return False
+    return confirm("Proceed anyway?", non_interactive, dry_run=dry_run)
+
+
 # ── Auto-follow API helpers ────────────────────────────────────────────────
 
 def create_autofollow_rule(
@@ -569,17 +617,87 @@ def _retry_with_backoff(fn, max_attempts: int = 3, base_delay: float = 2.0) -> b
 
 
 # ── Confirmation prompts ───────────────────────────────────────────────────
+#
+# Prompts are answered at the terminal, or — when --approval-dir is set — through
+# files, so a CI system can show each prompt to an approver:
+#
+#   script writes  <dir>/prompt.json   {"id": "001", "kind": "yesno"|"delete",
+#                                       "question": "...", "details": [...]}
+#   approver side  <dir>/answer-001    "yes" / "no"  (yesno)   or  "DELETE" / "no"  (delete)
+#
+# The script waits up to --approval-timeout seconds per prompt; no answer means "no".
+
+_APPROVAL_DIR: Optional[Path] = None
+_APPROVAL_TIMEOUT: float = 3600.0
+_prompt_seq = 0
+
+
+def configure_approvals(approval_dir: Optional[str], timeout: Optional[float]) -> None:
+    global _APPROVAL_DIR, _APPROVAL_TIMEOUT
+    if approval_dir:
+        _APPROVAL_DIR = Path(approval_dir)
+        _APPROVAL_DIR.mkdir(parents=True, exist_ok=True)
+        # Drop leftovers from an earlier run so an old answer can never be reused.
+        for leftover in list(_APPROVAL_DIR.glob("answer-*")) + list(_APPROVAL_DIR.glob("prompt.json")):
+            leftover.unlink(missing_ok=True)
+    if timeout is not None:
+        _APPROVAL_TIMEOUT = timeout
+
+
+def _ask_approver(kind: str, question: str, details: Optional[list[str]] = None) -> str:
+    """Publish a prompt to the approval directory and block until it is answered."""
+    global _prompt_seq
+    assert _APPROVAL_DIR is not None
+    _prompt_seq += 1
+    pid = f"{_prompt_seq:03d}"
+    payload = {"id": pid, "kind": kind, "question": question, "details": details or []}
+    tmp = _APPROVAL_DIR / f".prompt-{pid}.tmp"
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(_APPROVAL_DIR / "prompt.json")          # atomic publish
+    print(f"\n{C.YELLOW}?  [approval #{pid}] {question}{C.RESET}", flush=True)
+    info(f"Waiting for an approver (up to {_APPROVAL_TIMEOUT:.0f}s)...")
+
+    answer_file = _APPROVAL_DIR / f"answer-{pid}"
+    deadline = time.monotonic() + _APPROVAL_TIMEOUT
+    answer = ""
+    while time.monotonic() < deadline:
+        if answer_file.exists():
+            answer = answer_file.read_text(encoding="utf-8").strip()
+            break
+        time.sleep(1)
+    else:
+        err(f"[approval #{pid}] no answer within {_APPROVAL_TIMEOUT:.0f}s — treating as 'no'.")
+    (_APPROVAL_DIR / "prompt.json").unlink(missing_ok=True)
+    info(f"[approval #{pid}] answer: {answer or '(none)'}")
+    return answer
+
+
+def _read_terminal(prompt_text: str) -> Optional[str]:
+    """input() that returns None instead of crashing when no terminal is attached."""
+    print(prompt_text, end="", flush=True)
+    try:
+        return input().strip()
+    except EOFError:
+        print()
+        err("No answer available (stdin closed). Run in a terminal, or use --approval-dir.")
+        return None
+
 
 def confirm(prompt: str, non_interactive: bool = False, dry_run: bool = False) -> bool:
+    """
+    Ask a yes/no question. non_interactive is for library callers only (ci/bootstrap.py);
+    the CLI has no auto-confirm mode.
+    """
     if dry_run:
         dry(f"(dry-run) skipping confirmation: {prompt}")
         return True
     if non_interactive:
         info(f"(non-interactive) auto-confirming: {prompt}")
         return True
-    print(f"\n{C.YELLOW}?  {prompt}{C.RESET}  [y/N] ", end="", flush=True)
-    answer = input().strip().lower()
-    return answer in ("y", "yes")
+    if _APPROVAL_DIR is not None:
+        return _ask_approver("yesno", prompt) == "yes"
+    answer = _read_terminal(f"\n{C.YELLOW}?  {prompt}{C.RESET}  [y/N] ")
+    return (answer or "").lower() in ("y", "yes")
 
 
 def confirm_destructive(
@@ -612,9 +730,17 @@ def confirm_destructive(
         info("(non-interactive) auto-confirming destructive delete.")
         return True
 
-    print(f"\n{C.BOLD}Type  DELETE  (uppercase) to confirm, or anything else to abort: {C.RESET}",
-          end="", flush=True)
-    answer = input().strip()
+    if _APPROVAL_DIR is not None:
+        answer = _ask_approver(
+            "delete",
+            f"PERMANENTLY DELETE {len(indices)} index(es) on {cluster_url} "
+            "so they can be re-created by replication?",
+            details=indices,
+        )
+    else:
+        answer = _read_terminal(
+            f"\n{C.BOLD}Type  DELETE  (uppercase) to confirm, or anything else to abort: {C.RESET}"
+        )
     if answer == "DELETE":
         return True
     warn("Aborted — indices were NOT deleted.")
@@ -625,6 +751,7 @@ def confirm_destructive(
 
 def delete_and_start_replication(
     follower_url: str,
+    leader_url: str,
     leader_alias: str,
     indices: list[str],
     cfg: Config,
@@ -644,6 +771,11 @@ def delete_and_start_replication(
     Wildcard cleanup: when autofollow_rules is provided, any indices on the follower
     cluster that match a wildcard pattern (e.g. products-1, products-2) are stopped,
     unblocked, and deleted before the auto-follow rule is re-created on this cluster.
+
+    Safety check: an index is only deleted from the follower if it also exists on the
+    new leader (leader_url). If any index exists only on the follower, or either
+    cluster cannot answer, nothing is deleted and False is returned — deleting it
+    would lose the only copy, since replication can only re-create what the leader has.
     """
 
     # ── Discover wildcard-managed indices that also need to be cleaned up ──
@@ -656,8 +788,30 @@ def delete_and_start_replication(
             if extra:
                 wildcard_extra.extend(extra)
 
-    # ── Destructive confirmation (shows named + wildcard indices) ──────────
     all_to_delete = indices + wildcard_extra
+
+    # ── Safety check: never delete the only copy of an index ───────────────
+    step(f"Safety check — every index to delete must also exist on the new leader ({leader_url})")
+    unsafe: list[str] = []
+    for idx in all_to_delete:
+        on_follower = index_exists(follower_url, idx, cfg)
+        if on_follower is False:
+            continue  # nothing on the follower to delete
+        on_leader = index_exists(leader_url, idx, cfg)
+        if on_follower is None or on_leader is None:
+            unsafe.append(f"{idx}  (could not check: follower={on_follower}, leader={on_leader})")
+        elif on_leader is False:
+            unsafe.append(f"{idx}  (exists on {follower_url} but NOT on the leader {leader_url})")
+    if unsafe:
+        err("Refusing to delete — these indices would be lost:")
+        for line in unsafe:
+            err(f"    ✗  {line}")
+        err("Nothing was deleted. Copy or reindex them to the leader (or remove them from "
+            "indices.json / delete them yourself if they are not needed), then re-run.")
+        return False
+    ok(f"  all {len(all_to_delete)} index(es) to replace are present on the leader")
+
+    # ── Destructive confirmation (shows named + wildcard indices) ──────────
     if not confirm_destructive(follower_url, all_to_delete, non_interactive, dry_run=cfg.dry_run):
         info("Skipped. You can delete the indices and start replication manually later.")
         return False
@@ -705,9 +859,11 @@ def _apply_autofollow_rules(
     cfg: Config,
     action: str,  # "create" or "delete"
     non_interactive: bool = False,
-) -> None:
+) -> bool:
     """
     Create or delete all auto-follow rules on a follower cluster.
+    Returns True when every create/delete API call succeeded (a rule that already
+    exists with the same pattern, or that the operator chose to keep, counts as success).
 
     action="create":
       Before creating each rule, checks whether a rule with the same name already
@@ -725,8 +881,9 @@ def _apply_autofollow_rules(
       clean teardown.
     """
     if not autofollow_rules:
-        return
+        return True
 
+    all_ok = True
     if action == "create":
         for rule in autofollow_rules:
             existing = get_existing_autofollow_rule(follower_url, rule["name"], cfg)
@@ -746,11 +903,14 @@ def _apply_autofollow_rules(
                 ):
                     warn(f"  [{rule['name']}] skipped — existing rule kept.")
                     continue
-                delete_autofollow_rule(follower_url, leader_alias, rule["name"], cfg)
-            create_autofollow_rule(
+                if not delete_autofollow_rule(follower_url, leader_alias, rule["name"], cfg):
+                    all_ok = False
+                    continue
+            if not create_autofollow_rule(
                 follower_url, leader_alias,
                 rule["name"], rule["pattern"], cfg,
-            )
+            ):
+                all_ok = False
 
     elif action == "delete":
         for rule in autofollow_rules:
@@ -772,7 +932,10 @@ def _apply_autofollow_rules(
                 info(f"  [{rule['name']}] pattern '{pattern}' → "
                      f"no existing follower indices found on this cluster")
 
-            delete_autofollow_rule(follower_url, leader_alias, rule["name"], cfg)
+            if not delete_autofollow_rule(follower_url, leader_alias, rule["name"], cfg):
+                all_ok = False
+
+    return all_ok
 
 
 # ── High-level operations ──────────────────────────────────────────────────
@@ -782,7 +945,7 @@ def do_failover(
     indices: list[str],
     autofollow_rules: list[dict],
     non_interactive: bool = False,
-) -> None:
+) -> bool:
     """
     FAILOVER  (normal → DR active)
 
@@ -794,6 +957,8 @@ def do_failover(
       2. Delete auto-follow rules on SECONDARY (it was the follower)
       3. Delete indices on PRIMARY + start replication (following SECONDARY)
       4. Create auto-follow rules on PRIMARY (it is now the follower)
+
+    Returns True only when every step succeeded (False on abort or any API failure).
     """
     header("FAILOVER — Activating DR site")
     if cfg.dry_run:
@@ -808,6 +973,10 @@ def do_failover(
         info(f"Auto-follow    : {len(autofollow_rules)} rule(s) — "
              + ", ".join(f"{r['name']}={r['pattern']}" for r in autofollow_rules))
 
+    step("Pre-check — the cluster being promoted must be healthy")
+    if not require_healthy_new_leader("SECONDARY", cfg.secondary_url, cfg):
+        return False
+
     # ── Step 1: Break replication on SECONDARY ────────────────────────────
     step("Step 1 — Stop replication on SECONDARY and make indices read/write")
     info(f"Target cluster : {cfg.secondary_url}")
@@ -819,7 +988,7 @@ def do_failover(
         dry_run=cfg.dry_run,
     ):
         info("Aborted.")
-        return
+        return False
 
     stop_results = [stop_replication(cfg.secondary_url, idx, cfg) for idx in indices]
     if not all(stop_results):
@@ -828,8 +997,8 @@ def do_failover(
     rw_results = [remove_write_block(cfg.secondary_url, idx, cfg) for idx in indices]
     if not all(rw_results):
         err("Failed to remove write blocks on some indices. Review errors above before proceeding.")
-        if not confirm("Proceed anyway?", non_interactive, dry_run=cfg.dry_run):
-            return
+        if not confirm_continue_after_error(non_interactive, cfg.dry_run):
+            return False
 
     # Tear down auto-follow rules before declaring SECONDARY active so no new
     # indices can be picked up by the rule in the window before it is deleted.
@@ -840,8 +1009,8 @@ def do_failover(
         dry_run=cfg.dry_run,
     ):
         info("Aborted.")
-        return
-    _apply_autofollow_rules(
+        return False
+    teardown_ok = _apply_autofollow_rules(
         cfg.secondary_url, cfg.primary_alias_on_secondary,
         autofollow_rules, cfg, action="delete",
     )
@@ -863,6 +1032,7 @@ def do_failover(
 
     started = delete_and_start_replication(
         follower_url=cfg.primary_url,
+        leader_url=cfg.secondary_url,
         leader_alias=cfg.secondary_alias_on_primary,
         indices=indices,
         cfg=cfg,
@@ -872,12 +1042,18 @@ def do_failover(
 
     # ── Step 4: Create auto-follow rules on PRIMARY (new follower) ────────
     step(f"Step 4 — Create auto-follow rules on PRIMARY ({cfg.primary_url})")
+    autofollow_ok = True
     if started and autofollow_rules:
-        _apply_autofollow_rules(
+        autofollow_ok = _apply_autofollow_rules(
             cfg.primary_url, cfg.secondary_alias_on_primary,
             autofollow_rules, cfg, action="create",
             non_interactive=non_interactive,
         )
+
+    if not (started and teardown_ok and autofollow_ok):
+        err("FAILOVER finished with errors — review the output above. "
+            "SECONDARY is active, but PRIMARY may not be following it.")
+        return False
 
     ok("FAILOVER complete.")
     info("")
@@ -885,6 +1061,7 @@ def do_failover(
     info(f"  Active (leader) cluster   : {cfg.secondary_url}")
     info(f"  Standby (follower) cluster: {cfg.primary_url}")
     info("  Run '--operation status' to verify replication health.")
+    return True
 
 
 def do_failback(
@@ -892,7 +1069,7 @@ def do_failback(
     indices: list[str],
     autofollow_rules: list[dict],
     non_interactive: bool = False,
-) -> None:
+) -> bool:
     """
     FAILBACK  (DR active → normal)
 
@@ -904,6 +1081,8 @@ def do_failback(
       2. Delete auto-follow rules on PRIMARY (it was the follower)
       3. Delete indices on SECONDARY + start replication (following PRIMARY)
       4. Create auto-follow rules on SECONDARY (it is now the follower)
+
+    Returns True only when every step succeeded (False on abort or any API failure).
     """
     header("FAILBACK — Restoring normal state")
     if cfg.dry_run:
@@ -918,6 +1097,10 @@ def do_failback(
         info(f"Auto-follow    : {len(autofollow_rules)} rule(s) — "
              + ", ".join(f"{r['name']}={r['pattern']}" for r in autofollow_rules))
 
+    step("Pre-check — the cluster being promoted must be healthy")
+    if not require_healthy_new_leader("PRIMARY", cfg.primary_url, cfg):
+        return False
+
     # ── Step 1: Break replication on PRIMARY ─────────────────────────────
     step("Step 1 — Stop replication on PRIMARY and make indices read/write")
     info(f"Target cluster : {cfg.primary_url}")
@@ -929,7 +1112,7 @@ def do_failback(
         dry_run=cfg.dry_run,
     ):
         info("Aborted.")
-        return
+        return False
 
     stop_results = [stop_replication(cfg.primary_url, idx, cfg) for idx in indices]
     if not all(stop_results):
@@ -938,8 +1121,8 @@ def do_failback(
     rw_results = [remove_write_block(cfg.primary_url, idx, cfg) for idx in indices]
     if not all(rw_results):
         err("Failed to remove write blocks on some indices. Review errors above before proceeding.")
-        if not confirm("Proceed anyway?", non_interactive, dry_run=cfg.dry_run):
-            return
+        if not confirm_continue_after_error(non_interactive, cfg.dry_run):
+            return False
 
     # Tear down auto-follow rules before declaring PRIMARY active.
     step(f"Step 2 — Delete auto-follow rules on PRIMARY ({cfg.primary_url})")
@@ -949,8 +1132,8 @@ def do_failback(
         dry_run=cfg.dry_run,
     ):
         info("Aborted.")
-        return
-    _apply_autofollow_rules(
+        return False
+    teardown_ok = _apply_autofollow_rules(
         cfg.primary_url, cfg.secondary_alias_on_primary,
         autofollow_rules, cfg, action="delete",
     )
@@ -971,6 +1154,7 @@ def do_failback(
 
     started = delete_and_start_replication(
         follower_url=cfg.secondary_url,
+        leader_url=cfg.primary_url,
         leader_alias=cfg.primary_alias_on_secondary,
         indices=indices,
         cfg=cfg,
@@ -980,12 +1164,18 @@ def do_failback(
 
     # ── Step 4: Create auto-follow rules on SECONDARY (new follower) ──────
     step(f"Step 4 — Create auto-follow rules on SECONDARY ({cfg.secondary_url})")
+    autofollow_ok = True
     if started and autofollow_rules:
-        _apply_autofollow_rules(
+        autofollow_ok = _apply_autofollow_rules(
             cfg.secondary_url, cfg.primary_alias_on_secondary,
             autofollow_rules, cfg, action="create",
             non_interactive=non_interactive,
         )
+
+    if not (started and teardown_ok and autofollow_ok):
+        err("FAILBACK finished with errors — review the output above. "
+            "PRIMARY is active, but SECONDARY may not be following it.")
+        return False
 
     ok("FAILBACK complete. Normal replication restored.")
     info("")
@@ -993,6 +1183,7 @@ def do_failback(
     info(f"  Active (leader) cluster   : {cfg.primary_url}")
     info(f"  Standby (follower) cluster: {cfg.secondary_url}")
     info("  Run '--operation status' to verify replication health.")
+    return True
 
 
 def do_status(cfg: Config, indices: list[str], autofollow_rules: list[dict]) -> None:
@@ -1151,8 +1342,13 @@ def parse_args() -> argparse.Namespace:
         help="AWS Secrets Manager ARN holding OpenSearch username/password",
     )
     parser.add_argument(
-        "--non-interactive", action="store_true",
-        help="Auto-confirm all prompts (for CI/automation)",
+        "--approval-dir", metavar="DIR",
+        help="Answer prompts through files in DIR instead of the terminal "
+             "(used by the CloudBees pipeline to turn each prompt into an approval)",
+    )
+    parser.add_argument(
+        "--approval-timeout", metavar="SECS", type=float,
+        help="Seconds to wait for each approval before treating it as 'no' (default: 3600)",
     )
     parser.add_argument("--no-colour", action="store_true", help="Disable ANSI colours")
     parser.add_argument(
@@ -1193,6 +1389,8 @@ def main() -> None:
     if args.dry_run:
         cfg.dry_run = True
 
+    configure_approvals(args.approval_dir, args.approval_timeout)
+
     indices          = load_indices(cfg.indices_file)
     autofollow_rules = load_autofollow_rules(cfg.indices_file)
 
@@ -1201,9 +1399,9 @@ def main() -> None:
         sys.exit(1)
 
     if args.operation == "failover":
-        do_failover(cfg, indices, autofollow_rules, non_interactive=args.non_interactive)
+        sys.exit(0 if do_failover(cfg, indices, autofollow_rules) else 1)
     elif args.operation == "failback":
-        do_failback(cfg, indices, autofollow_rules, non_interactive=args.non_interactive)
+        sys.exit(0 if do_failback(cfg, indices, autofollow_rules) else 1)
     elif args.operation == "status":
         do_status(cfg, indices, autofollow_rules)
     else:

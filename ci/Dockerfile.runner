@@ -1,0 +1,24 @@
+# Runner image for the CCR DR pipeline.
+# The repo scripts are baked in (not bind-mounted) so the pipeline works even when
+# the CloudBees agent is itself a container talking to the host's Docker socket.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+COPY dr-switchover.py find-missing-replication-indices.py indices.json ./
+COPY teams/ ./teams/
+COPY ci/config.ci.json ci/ccr_lib.py ci/bootstrap.py ci/assert_state.py ./ci/
+
+RUN useradd --create-home --uid 10001 runner
+USER runner
+
+ENTRYPOINT ["python3"]
+CMD ["dr-switchover.py", "--config", "ci/config.ci.json", "--operation", "status", "--no-colour"]
